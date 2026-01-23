@@ -23,6 +23,11 @@ import { CompilerCache } from './CompilerCache';
 
 const ctxFileStorage = new AsyncLocalStorage<FileContent>();
 
+// AsyncLocalStorage for query context to ensure thread-safe concurrent query execution.
+// This replaces the previous instance-level currentQuery property which caused race conditions
+// when multiple queries ran concurrently ("Cube not found" errors).
+const ctxQueryStorage = new AsyncLocalStorage<any>();
+
 const NATIVE_IS_SUPPORTED = isNativeSupported();
 
 const moduleFileCache = {};
@@ -174,7 +179,7 @@ export class DataSchemaCompiler {
   // FIXME: Is public only because of tests, should be private
   public compilePromise: any;
 
-  private currentQuery: any;
+  // NOTE: currentQuery moved to AsyncLocalStorage (ctxQueryStorage) to fix concurrent query race conditions
 
   public constructor(repository: SchemaFileRepository, options: DataSchemaCompilerOptions) {
     this.repository = repository;
@@ -794,17 +799,13 @@ export class DataSchemaCompiler {
   }
 
   public withQuery(query, fn) {
-    const oldQuery = this.currentQuery;
-    this.currentQuery = query;
-    try {
-      return fn();
-    } finally {
-      this.currentQuery = oldQuery;
-    }
+    // Use AsyncLocalStorage to ensure query context is isolated per async execution context.
+    // This fixes race conditions where concurrent queries would overwrite each other's context.
+    return ctxQueryStorage.run(query, fn);
   }
 
   public contextQuery() {
-    return this.currentQuery;
+    return ctxQueryStorage.getStore();
   }
 
   private async compileCubeFiles(
