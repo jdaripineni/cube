@@ -50,6 +50,7 @@ All features are gated behind the `schemaIntelligence` option. When disabled (de
 When enabled:
 - Optional dependencies (`better-sqlite3`, `@xenova/transformers`, `pg`) are loaded lazily
 - AI endpoints become available under `/v1/ai/*`
+- Schemas are **automatically indexed** on every compilation (and recompilation) — no manual reindex needed
 
 ## API Endpoints
 
@@ -93,7 +94,8 @@ Check intelligence module status (indexed count, providers, etc.).
 Prometheus metrics. Use `?format=prometheus` for text format.
 
 ### `POST /v1/ai/reindex`
-Force re-indexing of all schemas.
+Force re-indexing of all schemas. Schemas are also automatically re-indexed whenever
+the data model is recompiled, so this is only needed if you want to trigger it manually.
 
 ## Embedding Providers
 
@@ -131,19 +133,18 @@ Default weights (customizable):
 | `datasource_explicit` | 0.10 | Data source is explicitly declared |
 | `join_descriptions` | 0.10 | Joins have descriptions |
 
-## atlas.cubejs.service Integration
+## Environment Variables
 
-Set these environment variables in your Helm values:
+All settings can also be driven via environment variables:
 
-```yaml
-env:
-  CUBEJS_SCHEMA_INTELLIGENCE: "true"
-  CUBEJS_AI_EMBEDDING_PROVIDER: "local"
-  CUBEJS_AI_VECTOR_STORE: "memory"
-  # Optional: enable NLQ translation
-  CUBEJS_AI_LLM_PROVIDER: "openai"
-  CUBEJS_AI_LLM_API_KEY: "<from-secret>"
-  CUBEJS_AI_LLM_MODEL: "gpt-4o-mini"
+```bash
+CUBEJS_SCHEMA_INTELLIGENCE=true
+CUBEJS_AI_EMBEDDING_PROVIDER=local       # local (default) | openai | ollama
+CUBEJS_AI_VECTOR_STORE=memory            # memory (default) | pgvector
+# Optional: enable NLQ translation
+CUBEJS_AI_LLM_PROVIDER=openai
+CUBEJS_AI_LLM_API_KEY=<your-key>
+CUBEJS_AI_LLM_MODEL=gpt-4o-mini
 ```
 
 ## Architecture

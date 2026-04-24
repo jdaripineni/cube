@@ -44,14 +44,9 @@ With 200+ cube schemas, finding the right schema for a query becomes a needle-in
 | `packages/cubejs-server-core/src/core/types.ts` | Added `schemaIntelligence` to `CreateOptions` |
 | `packages/cubejs-server-core/src/core/optionsValidate.ts` | Added Joi validation schema |
 | `packages/cubejs-server-core/src/core/server.ts` | Lazy initialization on first `getCompilerApi()` call |
-| `packages/cubejs-server-core/src/core/CompilerApi.ts` | Added `schemaIntelligenceModule` property + getter |
+| `packages/cubejs-server-core/src/core/CompilerApi.ts` | Added `schemaIntelligenceModule` property + getter; auto-reindex hook in `compileSchema()` |
 | `packages/cubejs-api-gateway/src/types/strings.ts` | Added `'ai'` to `ApiScopes` union |
-| `packages/cubejs-api-gateway/src/gateway.ts` | Added 7 AI routes under `/v1/ai/*` + scope validation |
-
-### Modified Files in atlas.cubejs.service
-| File | Change |
-|------|--------|
-| `cubejs/cube.js` | Added env-var-driven `schemaIntelligence` config block |
+| `packages/cubejs-api-gateway/src/gateway.ts` | Added 7 AI routes under `/v1/ai/*` + scope validation; `/v1/ai/reindex` fetches cubes from compiler |
 
 ## API Endpoints (all require `ai` scope)
 
@@ -72,13 +67,12 @@ With 200+ cube schemas, finding the right schema for a query becomes a needle-in
 module.exports = { schemaIntelligence: true };
 ```
 
-### atlas.cubejs.service (Helm)
-```yaml
-env:
-  CUBEJS_SCHEMA_INTELLIGENCE: "true"
-  CUBEJS_AI_EMBEDDING_PROVIDER: "local"  # or openai, ollama
-  CUBEJS_AI_LLM_PROVIDER: "openai"       # optional, enables translation
-  CUBEJS_AI_LLM_API_KEY: "<secret>"
+### Environment Variables
+```bash
+CUBEJS_SCHEMA_INTELLIGENCE=true
+CUBEJS_AI_EMBEDDING_PROVIDER=local   # local (default) | openai | ollama
+CUBEJS_AI_LLM_PROVIDER=openai        # optional, enables translation
+CUBEJS_AI_LLM_API_KEY=<secret>
 ```
 
 ## Testing
@@ -90,7 +84,7 @@ npm test
 
 ## Future Work
 
-- [ ] Auto-reindex on `onSchemaCompiled` hook via CompilerApi compilerId watch
+- [x] Auto-reindex on `onSchemaCompiled` hook via CompilerApi compilerId watch
 - [ ] Weaviate/Qdrant vector store providers
 - [ ] Streaming translation responses
 - [ ] Multi-turn conversation state management
