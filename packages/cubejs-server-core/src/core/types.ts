@@ -245,6 +245,19 @@ export interface CreateOptions {
   allowNodeRequire?: boolean;
   semanticLayerSync?: (context: RequestContext) => Promise<BiToolSyncConfig[]> | BiToolSyncConfig[];
   fastReload?: boolean;
+  /**
+   * Enable AI-powered schema intelligence (scoring, vector search, NLQ translation).
+   * Pass `true` for defaults, or a config object. Disabled by default.
+   */
+  schemaIntelligence?: boolean | {
+    scoring?: boolean | { criteria?: Record<string, { weight: number; description?: string }> };
+    embedding?: { provider?: 'local' | 'openai' | 'ollama'; apiKey?: string; model?: string; baseUrl?: string };
+    vectorStore?: { provider?: 'memory' | 'pgvector'; connectionString?: string; dimensions?: number };
+    translator?: { enabled?: boolean; maxRetries?: number; maxContextSchemas?: number; fewShotCount?: number };
+    llm?: { provider?: 'openai' | 'ollama'; apiKey?: string; model?: string; baseUrl?: string; temperature?: number };
+    feedback?: { enabled?: boolean; dbPath?: string };
+    metrics?: boolean;
+  };
 }
 
 export interface DriverDecoratedOptions extends CreateOptions {

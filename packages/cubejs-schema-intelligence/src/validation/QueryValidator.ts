@@ -1,0 +1,191 @@
+/**
+ * @license Apache-2.0
+ * @copyright Cube Dev, Inc.
+ * @fileoverview Query validator — validates LLM-generated Cube queries against compiled meta.
+ */
+
+import type {
+  CubeQuery,
+  CubeMetaConfig,
+  ValidationResult,
+  ValidationError,
+} from '../types';
+
+export class QueryValidator {
+  private cubeMap: Map<string, CubeMetaConfig>;
+  private measureSet: Set<string>;
+  private dimensionSet: Set<string>;
+  private segmentSet: Set<string>;
+
+  constructor(cubes: CubeMetaConfig[]) {
+    this.cubeMap = new Map();
+    this.measureSet = new Set();
+    this.dimensionSet = new Set();
+    this.segmentSet = new Set();
+
+    for (const cube of cubes) {
+      this.cubeMap.set(cube.name, cube);
+      for (const m of cube.measures || []) {
+        this.measureSet.add(m.name);
+      }
+      for (const d of cube.dimensions || []) {
+        this.dimensionSet.add(d.name);
+      }
+      for (const s of cube.segments || []) {
+        this.segmentSet.add(s.name);
+      }
+    }
+  }
+
+  validate(query: CubeQuery): ValidationResult {
+    const errors: ValidationError[] = [];
+    const suggestions: string[] = [];
+
+    if (!query) {
+      errors.push({
+        type: 'missing_required',
+        message: 'Query is null or undefined',
+      });
+      return { valid: false, errors, suggestions };
+    }
+
+    // Must have at least measures or dimensions
+    const hasMeasures = query.measures && query.measures.length > 0;
+    const hasDimensions = query.dimensions && query.dimensions.length > 0;
+    if (!hasMeasures && !hasDimensions) {
+      errors.push({
+        type: 'missing_required',
+        message: 'Query must have at least one measure or dimension',
+      });
+    }
+
+    // Validate measures
+    for (const measure of query.measures || []) {
+      if (!this.measureSet.has(measure)) {
+        const suggestion = this.findClosest(measure, this.measureSet);
+        errors.push({
+          type: 'unknown_member',
+          message: `Unknown measure: ${measure}`,
+          member: measure,
+        });
+        if (suggestion) {
+          suggestions.push(`Did you mean '${suggestion}' instead of '${measure}'?`);
+        }
+      }
+    }
+
+    // Validate dimensions
+    for (const dim of query.dimensions || []) {
+      if (!this.dimensionSet.has(dim)) {
+        const suggestion = this.findClosest(dim, this.dimensionSet);
+        errors.push({
+          type: 'unknown_member',
+          message: `Unknown dimension: ${dim}`,
+          member: dim,
+        });
+        if (suggestion) {
+          suggestions.push(`Did you mean '${suggestion}' instead of '${dim}'?`);
+        }
+      }
+    }
+
+    // Validate segments
+    for (const seg of query.segments || []) {
+      if (!this.segmentSet.has(seg)) {
+        errors.push({
+          type: 'unknown_member',
+          message: `Unknown segment: ${seg}`,
+          member: seg,
+        });
+      }
+    }
+
+    // Validate time dimensions
+    for (const td of query.timeDimensions || []) {
+      if (!this.dimensionSet.has(td.dimension)) {
+        errors.push({
+          type: 'invalid_time_dimension',
+          message: `Unknown time dimension: ${td.dimension}`,
+          member: td.dimension,
+        });
+      } else {
+        // Verify it's actually a time type
+        const parts = td.dimension.split('.');
+        if (parts.length === 2) {
+          const cube = this.cubeMap.get(parts[0]);
+          const dim = cube?.dimensions?.find(d => d.name === td.dimension);
+          if (dim && dim.type !== 'time') {
+            errors.push({
+              type: 'type_mismatch',
+              message: `Dimension '${td.dimension}' is type '${dim.type}', not 'time'`,
+              member: td.dimension,
+            });
+          }
+        }
+      }
+    }
+
+    // Validate filters
+    const validateFilters = (filters: any[] | undefined) => {
+      for (const f of filters || []) {
+        if (f.member) {
+          const inMeasures = this.measureSet.has(f.member);
+          const inDimensions = this.dimensionSet.has(f.member);
+          if (!inMeasures && !inDimensions) {
+            errors.push({
+              type: 'unknown_member',
+              message: `Unknown filter member: ${f.member}`,
+              member: f.member,
+            });
+          }
+        }
+        if (f.and) validateFilters(f.and);
+        if (f.or) validateFilters(f.or);
+      }
+    };
+    validateFilters(query.filters);
+
+    return {
+      valid: errors.length === 0,
+      errors,
+      suggestions,
+    };
+  }
+
+  private findClosest(name: string, candidates: Set<string>): string | null {
+    const nameLower = name.toLowerCase();
+    let best: string | null = null;
+    let bestDist = Infinity;
+
+    for (const c of candidates) {
+      const dist = this.levenshtein(nameLower, c.toLowerCase());
+      if (dist < bestDist && dist <= 3) {
+        bestDist = dist;
+        best = c;
+      }
+    }
+
+    return best;
+  }
+
+  private levenshtein(a: string, b: string): number {
+    const m = a.length;
+    const n = b.length;
+    const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+
+    for (let i = 0; i <= m; i++) dp[i][0] = i;
+    for (let j = 0; j <= n; j++) dp[0][j] = j;
+
+    for (let i = 1; i <= m; i++) {
+      for (let j = 1; j <= n; j++) {
+        dp[i][j] = Math.min(
+          dp[i - 1][j] + 1,
+          dp[i][j - 1] + 1,
+          dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+        );
+      }
+    }
+
+    return dp[m][n];
+  }
+}

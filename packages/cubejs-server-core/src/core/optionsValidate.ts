@@ -149,6 +149,47 @@ const schemaOptions = Joi.object().keys({
   serverless: Joi.boolean(),
   allowNodeRequire: Joi.boolean(),
   fastReload: Joi.boolean(),
+  // AI schema intelligence
+  schemaIntelligence: Joi.alternatives().try(
+    Joi.boolean(),
+    Joi.object().keys({
+      scoring: Joi.alternatives().try(Joi.boolean(), Joi.object().keys({
+        criteria: Joi.object().pattern(Joi.string(), Joi.object().keys({
+          weight: Joi.number().min(0).max(1),
+          description: Joi.string(),
+        })),
+      })),
+      embedding: Joi.object().keys({
+        provider: Joi.string().valid('local', 'openai', 'ollama'),
+        apiKey: Joi.string(),
+        model: Joi.string(),
+        baseUrl: Joi.string(),
+      }),
+      vectorStore: Joi.object().keys({
+        provider: Joi.string().valid('memory', 'pgvector'),
+        connectionString: Joi.string(),
+        dimensions: Joi.number().integer().min(1),
+      }),
+      translator: Joi.object().keys({
+        enabled: Joi.boolean(),
+        maxRetries: Joi.number().integer().min(0),
+        maxContextSchemas: Joi.number().integer().min(1),
+        fewShotCount: Joi.number().integer().min(0),
+      }),
+      llm: Joi.object().keys({
+        provider: Joi.string().valid('openai', 'ollama'),
+        apiKey: Joi.string(),
+        model: Joi.string(),
+        baseUrl: Joi.string(),
+        temperature: Joi.number().min(0).max(2),
+      }),
+      feedback: Joi.object().keys({
+        enabled: Joi.boolean(),
+        dbPath: Joi.string(),
+      }),
+      metrics: Joi.boolean(),
+    })
+  ),
 });
 
 export default (options: any) => {

@@ -133,6 +133,19 @@ export class CompilerApi {
 
   protected queryFactory?: QueryFactory;
 
+  /**
+   * Optional schema intelligence module (AI-powered scoring, search, translation).
+   * Set by CubejsServerCore when schemaIntelligence option is enabled.
+   */
+  public schemaIntelligenceModule?: any;
+
+  /**
+   * Returns the schema intelligence module if configured.
+   */
+  public getSchemaIntelligence(): any | undefined {
+    return this.schemaIntelligenceModule;
+  }
+
   public constructor(repository: SchemaFileRepository, dbType: DbTypeInternalFn, options: CompilerApiOptions) {
     this.repository = repository;
     this.dbType = dbType;

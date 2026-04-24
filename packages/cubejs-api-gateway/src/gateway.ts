@@ -515,6 +515,115 @@ class ApiGateway {
     );
 
     /** **************************************************************
+     * ai scope (schema-intelligence)                                *
+     *************************************************************** */
+
+    app.post(`${this.basePath}/v1/ai/search`, jsonParser, userMiddlewares, userAsyncHandler(async (req: any, res) => {
+      await this.assertApiScope('ai', req.context?.securityContext);
+      const compilerApi = await this.getCompilerApi(req.context);
+      const intelligence = compilerApi.getSchemaIntelligence?.();
+      if (!intelligence) {
+        res.status(404).json({ error: 'Schema intelligence is not enabled' });
+        return;
+      }
+      const { query, limit } = req.body;
+      if (!query || typeof query !== 'string') {
+        res.status(400).json({ error: 'Missing required field: query (string)' });
+        return;
+      }
+      const results = await intelligence.search(query, limit || 5);
+      res.json({ results });
+    }));
+
+    app.post(`${this.basePath}/v1/ai/translate`, jsonParser, userMiddlewares, userAsyncHandler(async (req: any, res) => {
+      await this.assertApiScope('ai', req.context?.securityContext);
+      const compilerApi = await this.getCompilerApi(req.context);
+      const intelligence = compilerApi.getSchemaIntelligence?.();
+      if (!intelligence) {
+        res.status(404).json({ error: 'Schema intelligence is not enabled' });
+        return;
+      }
+      const { question, conversationHistory } = req.body;
+      if (!question || typeof question !== 'string') {
+        res.status(400).json({ error: 'Missing required field: question (string)' });
+        return;
+      }
+      const result = await intelligence.translate(question, conversationHistory);
+      res.json(result);
+    }));
+
+    app.get(`${this.basePath}/v1/ai/scores`, userMiddlewares, userAsyncHandler(async (req: any, res) => {
+      await this.assertApiScope('ai', req.context?.securityContext);
+      const compilerApi = await this.getCompilerApi(req.context);
+      const intelligence = compilerApi.getSchemaIntelligence?.();
+      if (!intelligence) {
+        res.status(404).json({ error: 'Schema intelligence is not enabled' });
+        return;
+      }
+      const scores = await intelligence.getScores();
+      res.json({ scores });
+    }));
+
+    app.post(`${this.basePath}/v1/ai/feedback`, jsonParser, userMiddlewares, userAsyncHandler(async (req: any, res) => {
+      await this.assertApiScope('ai', req.context?.securityContext);
+      const compilerApi = await this.getCompilerApi(req.context);
+      const intelligence = compilerApi.getSchemaIntelligence?.();
+      if (!intelligence) {
+        res.status(404).json({ error: 'Schema intelligence is not enabled' });
+        return;
+      }
+      const { translationId, rating, correction } = req.body;
+      if (!translationId || typeof rating !== 'number') {
+        res.status(400).json({ error: 'Missing required fields: translationId (string), rating (number 1-5)' });
+        return;
+      }
+      await intelligence.submitFeedback(translationId, rating, correction);
+      res.json({ ok: true });
+    }));
+
+    app.get(`${this.basePath}/v1/ai/status`, userMiddlewares, userAsyncHandler(async (req: any, res) => {
+      await this.assertApiScope('ai', req.context?.securityContext);
+      const compilerApi = await this.getCompilerApi(req.context);
+      const intelligence = compilerApi.getSchemaIntelligence?.();
+      if (!intelligence) {
+        res.json({ enabled: false });
+        return;
+      }
+      const status = await intelligence.getStatus();
+      res.json({ enabled: true, ...status });
+    }));
+
+    app.get(`${this.basePath}/v1/ai/metrics`, userMiddlewares, userAsyncHandler(async (req: any, res) => {
+      await this.assertApiScope('ai', req.context?.securityContext);
+      const compilerApi = await this.getCompilerApi(req.context);
+      const intelligence = compilerApi.getSchemaIntelligence?.();
+      if (!intelligence) {
+        res.status(404).json({ error: 'Schema intelligence is not enabled' });
+        return;
+      }
+      const metrics = intelligence.getMetrics();
+      const format = req.query.format === 'prometheus' ? 'prometheus' : 'json';
+      if (format === 'prometheus') {
+        res.set('Content-Type', 'text/plain');
+        res.send(metrics.toPrometheus());
+      } else {
+        res.json(metrics.toJSON());
+      }
+    }));
+
+    app.post(`${this.basePath}/v1/ai/reindex`, jsonParser, userMiddlewares, userAsyncHandler(async (req: any, res) => {
+      await this.assertApiScope('ai', req.context?.securityContext);
+      const compilerApi = await this.getCompilerApi(req.context);
+      const intelligence = compilerApi.getSchemaIntelligence?.();
+      if (!intelligence) {
+        res.status(404).json({ error: 'Schema intelligence is not enabled' });
+        return;
+      }
+      await intelligence.reindex();
+      res.json({ ok: true });
+    }));
+
+    /** **************************************************************
      * Private API (no scopes)                                       *
      *************************************************************** */
 
@@ -2545,7 +2654,7 @@ class ApiGateway {
           );
         } else {
           scopes.forEach((p) => {
-            if (['graphql', 'meta', 'data', 'sql', 'jobs'].indexOf(p) === -1) {
+            if (['graphql', 'meta', 'data', 'sql', 'jobs', 'ai'].indexOf(p) === -1) {
               throw new Error(
                 `A user-defined contextToApiScopes function returns a wrong scope: ${p}`
               );

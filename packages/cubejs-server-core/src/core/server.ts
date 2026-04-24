@@ -551,6 +551,19 @@ export class CubejsServerCore {
       this.compilerCache.set(appId, compilerApi);
     }
 
+    // Attach schema intelligence if enabled and not already set
+    if (this.options.schemaIntelligence && !compilerApi.schemaIntelligenceModule) {
+      try {
+        const { SchemaIntelligenceModule } = require('@cubejs-backend/schema-intelligence');
+        const opts = this.options.schemaIntelligence === true ? {} : this.options.schemaIntelligence;
+        const mod = new SchemaIntelligenceModule({ ...opts, enabled: true }, this.logger);
+        await mod.initialize();
+        compilerApi.schemaIntelligenceModule = mod;
+      } catch (e: any) {
+        this.logger('Schema Intelligence Init Error', { error: e.message });
+      }
+    }
+
     compilerApi.schemaVersion = currentSchemaVersion;
     return compilerApi;
   }
