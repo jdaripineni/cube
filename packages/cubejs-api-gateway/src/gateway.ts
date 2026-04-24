@@ -619,7 +619,12 @@ class ApiGateway {
         res.status(404).json({ error: 'Schema intelligence is not enabled' });
         return;
       }
-      await intelligence.reindex();
+      // Fetch current cubes from the compiler so reindex always has data
+      const { cubes, compilerId } = await compilerApi.metaConfig(req.context, {
+        includeCompilerId: true,
+        skipVisibilityPatch: true,
+      });
+      await intelligence.reindex(cubes);
       res.json({ ok: true });
     }));
 

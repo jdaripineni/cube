@@ -288,6 +288,19 @@ export class CompilerApi {
         duration: ((new Date()).getTime() - startCompilingTime),
       });
 
+      // Notify schema intelligence module (if enabled) so it can re-index.
+      // Fire-and-forget to avoid blocking the compilation path.
+      if (this.schemaIntelligenceModule) {
+        const cubes = compilers.metaTransformer?.cubes;
+        if (cubes && compilers.compilerId) {
+          this.schemaIntelligenceModule.onSchemaCompiled(cubes, compilers.compilerId).catch((e: any) => {
+            this.logger('Schema Intelligence indexing error', {
+              error: (e.stack || e).toString(),
+            });
+          });
+        }
+      }
+
       return compilers;
     } catch (e: any) {
       this.logger('Compiling schema error', {
