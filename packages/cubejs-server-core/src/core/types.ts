@@ -255,7 +255,8 @@ export interface CreateOptions {
     vectorStore?: { provider?: 'memory' | 'pgvector'; connectionString?: string; dimensions?: number };
     translator?: { enabled?: boolean; maxRetries?: number; maxContextSchemas?: number; fewShotCount?: number };
     llm?: { provider?: 'openai' | 'ollama'; apiKey?: string; model?: string; baseUrl?: string; temperature?: number };
-    feedback?: { enabled?: boolean; dbPath?: string };
+    feedback?: { enabled?: boolean; dbPath?: string; connectionOptions?: Record<string, any> };
+    conversation?: { provider?: 'memory' | 'redis'; sessionTtlMs?: number; maxTurns?: number; promptHistorySize?: number; connectionOptions?: Record<string, any> };
     metrics?: boolean;
   };
 }

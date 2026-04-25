@@ -202,6 +202,7 @@ const schemaOptions = Joi.object().keys({
       feedback: Joi.object().keys({
         enabled: Joi.boolean(),
         dbPath: Joi.string(),
+        connectionOptions: Joi.object().pattern(Joi.string(), Joi.any()),
       }),
       // Search behavior: defaults, diversity, over-retrieve factor
       search: Joi.object().keys({
@@ -213,6 +214,14 @@ const schemaOptions = Joi.object().keys({
       }),
       // Expose Prometheus metrics at /v1/ai/metrics
       metrics: Joi.boolean(),
+      // Conversation session store for multi-turn NLQ dialogue
+      conversation: Joi.object().keys({
+        provider: Joi.string().valid('memory', 'redis'),
+        sessionTtlMs: Joi.number().integer().min(1000),
+        maxTurns: Joi.number().integer().min(1),
+        promptHistorySize: Joi.number().integer().min(1),
+        connectionOptions: Joi.object().pattern(Joi.string(), Joi.any()),
+      }),
     })
   ),
 });
