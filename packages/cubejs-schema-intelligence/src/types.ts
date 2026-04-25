@@ -479,6 +479,49 @@ export interface ConversationMessage {
   content: string;
 }
 
+// ── Conversation Sessions ──
+
+/** A single turn in a conversation — the user's question and the system's response. */
+export interface ConversationTurn {
+  /** The user's natural language question. */
+  nlq: string;
+  /** The generated Cube query (null if translation failed). */
+  query: CubeQuery | null;
+  /** Translation ID for feedback linking. */
+  translationId: string;
+  /** When this turn occurred. */
+  timestamp: Date;
+}
+
+/**
+ * A server-managed conversation session.
+ * Maintains multi-turn state so clients can send follow-up questions
+ * (e.g., "now filter that by status=active") or corrections
+ * (e.g., "no, I meant revenue not order count") without managing history themselves.
+ */
+export interface ConversationSession {
+  /** Unique conversation ID (returned to the client). */
+  conversationId: string;
+  /** Ordered list of turns in this conversation. */
+  turns: ConversationTurn[];
+  /** Security context for this conversation (bound on creation). */
+  securityContext?: any;
+  /** When the session was created. */
+  createdAt: Date;
+  /** When the session was last used (for TTL expiry). */
+  lastActiveAt: Date;
+}
+
+/** Configuration for the conversation manager. */
+export interface ConversationConfig {
+  /** Session time-to-live in milliseconds. Default: 30 minutes. */
+  sessionTtlMs?: number;
+  /** Maximum conversation turns to keep per session. Default: 20. */
+  maxTurns?: number;
+  /** Maximum number of recent turns to include in the LLM prompt. Default: 6. */
+  promptHistorySize?: number;
+}
+
 /** Result returned by the translator after converting NLQ → CubeQuery. */
 export interface TranslationResult {
   /** The generated Cube query, or `null` if translation failed completely. */
@@ -491,6 +534,8 @@ export interface TranslationResult {
   schemasUsed: string[];
   /** Unique ID for this translation. Use with the feedback API. */
   translationId: string;
+  /** Conversation ID for multi-turn follow-ups. Pass this back in subsequent requests. */
+  conversationId?: string;
   /** Validation errors from the self-heal loop (empty if query is valid). */
   validationErrors?: string[];
   /** How many retry iterations the self-heal loop performed. */
@@ -537,6 +582,8 @@ export interface FeedbackConfig {
 export interface FeedbackEntry {
   /** Translation ID this feedback relates to. */
   translationId: string;
+  /** Conversation ID linking related multi-turn translations. */
+  conversationId?: string;
   /** When the translation occurred. */
   timestamp: Date;
   /** Original natural-language question. */
@@ -812,6 +859,8 @@ export interface SchemaIntelligenceOptions {
   feedback?: FeedbackConfig;
   /** Search behavior config (defaults, diversity, custom strategy). See {@link SearchConfig}. */
   search?: SearchConfig;
+  /** Conversation session management. See {@link ConversationConfig}. */
+  conversation?: ConversationConfig;
   /** Restrict which views/cubes are exposed to the AI endpoints. Default: all cubes. */
   accessibleViews?: string[];
   /** Re-index vectors automatically when the data model is recompiled. Default: `true`. */

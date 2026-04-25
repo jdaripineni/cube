@@ -68,6 +68,7 @@ export class SqliteFeedbackStore implements FeedbackStore {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS feedback (
         translation_id TEXT PRIMARY KEY,
+        conversation_id TEXT,
         timestamp TEXT NOT NULL,
         nlq TEXT NOT NULL,
         generated_query TEXT,
@@ -87,11 +88,19 @@ export class SqliteFeedbackStore implements FeedbackStore {
       CREATE INDEX IF NOT EXISTS idx_feedback_rating ON feedback(rating);
       CREATE INDEX IF NOT EXISTS idx_feedback_timestamp ON feedback(timestamp);
       CREATE INDEX IF NOT EXISTS idx_feedback_schemas ON feedback(schemas_used);
+      CREATE INDEX IF NOT EXISTS idx_feedback_conversation ON feedback(conversation_id);
     `);
 
     // Migration: add nlq_embedding column if missing (existing installs)
     try {
       this.db.exec('ALTER TABLE feedback ADD COLUMN nlq_embedding TEXT');
+    } catch {
+      // Column already exists — expected
+    }
+
+    // Migration: add conversation_id column if missing (existing installs)
+    try {
+      this.db.exec('ALTER TABLE feedback ADD COLUMN conversation_id TEXT');
     } catch {
       // Column already exists — expected
     }
@@ -101,13 +110,14 @@ export class SqliteFeedbackStore implements FeedbackStore {
   async save(entry: FeedbackEntry): Promise<void> {
     const stmt = this.db.prepare(`
       INSERT OR REPLACE INTO feedback
-        (translation_id, timestamp, nlq, generated_query, schemas_used, rating,
+        (translation_id, conversation_id, timestamp, nlq, generated_query, schemas_used, rating,
          corrected_query, execution_success, execution_error, user_id, latency_ms, retry_count, nlq_embedding)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
       entry.translationId,
+      entry.conversationId || null,
       entry.timestamp.toISOString(),
       entry.nlq,
       entry.generatedQuery ? JSON.stringify(entry.generatedQuery) : null,

@@ -39,6 +39,7 @@ export type {
   VectorStoreConfig,
   DistanceMetricType,
   SearchConfig,
+  ConversationConfig,
 } from './types';
 
 // ── Result Types ──
@@ -48,6 +49,9 @@ export type {
   ScoreResult,
   TranslationResult,
   TranslationContext,
+  ConversationSession,
+  ConversationTurn,
+  ConversationMessage,
   FeedbackEntry,
   FeedbackStats,
   ValidationResult,
@@ -83,3 +87,4 @@ export { SqliteFeedbackStore } from './feedback/SqliteFeedbackStore';
 export { OpenAILLMProvider, OllamaLLMProvider, resolveLLMProvider, MODEL_REGISTRY } from './llm/LLMProviders';
 export { AgentsConfigLoader } from './config/AgentsConfigLoader';
 export { MetricsCollector } from './metrics/MetricsCollector';
+export { ConversationManager } from './conversation/ConversationManager';

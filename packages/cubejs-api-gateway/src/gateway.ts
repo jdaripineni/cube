@@ -543,16 +543,47 @@ class ApiGateway {
         res.status(404).json({ error: 'Schema intelligence is not enabled' });
         return;
       }
-      const { question, conversationHistory, dryRun } = req.body;
+      const { question, conversationId: reqConversationId, conversationHistory, dryRun } = req.body;
       if (!question || typeof question !== 'string') {
         res.status(400).json({ error: 'Missing required field: question (string)' });
         return;
       }
+
+      // Conversation session management:
+      // - If conversationId is provided, resume that session (history is built server-side)
+      // - If conversationHistory is provided without conversationId, use it directly (stateless mode)
+      // - If neither, create a new session automatically
+      const convManager = intelligence.getConversationManager();
+      let conversationId = reqConversationId;
+      let history = conversationHistory;
+
+      if (conversationId) {
+        // Resume existing session — build history from server-side state
+        const session = convManager.get(conversationId);
+        if (session) {
+          history = convManager.buildHistory(conversationId);
+        } else {
+          // Session expired or invalid — start a new one
+          conversationId = convManager.create(req.context?.securityContext);
+        }
+      } else if (!conversationHistory) {
+        // No conversationId and no client-supplied history — create a new session
+        conversationId = convManager.create(req.context?.securityContext);
+      }
+      // If conversationHistory was provided without conversationId, we use it as-is (stateless mode)
+
       const context = {
         securityContext: req.context?.securityContext,
-        conversationHistory,
+        conversationHistory: history,
       };
       const result = await intelligence.translate(question, context);
+
+      // Attach conversation ID to the response so the client can continue the conversation
+      if (conversationId) {
+        result.conversationId = conversationId;
+        // Record this turn in the session for future history building
+        convManager.addTurn(conversationId, question, result.query, result.translationId);
+      }
 
       // Auto-verify: compile the generated query to SQL to validate it's executable.
       // This provides implicit positive/negative feedback for continuous learning.

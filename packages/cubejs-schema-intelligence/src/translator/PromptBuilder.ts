@@ -29,6 +29,17 @@ Rules:
 - For time-based questions, always use timeDimensions, not filters.
 `;
 
+const CONVERSATION_RULES = `
+Multi-turn conversation rules:
+- When the user says "yes" or confirms, refine the PREVIOUS query based on additional instructions.
+- When the user says "no" or corrects, discard the previous query and re-interpret their intent.
+- When the user refers to "that", "it", "those results", or "the same", they mean the PREVIOUS query.
+- When the user asks to "also include", "add", or "but with": take the previous query and add the requested modification.
+- When the user asks to "filter", "only show", "exclude", or "remove": take the previous query and add/modify filters.
+- When the user asks to "change", "switch", or "replace": modify the specific part of the previous query.
+- Always output the COMPLETE query, not just the changed part.
+`;
+
 export interface PromptBuildOptions {
   nlq: string;
   schemas: string;
@@ -59,6 +70,11 @@ export class PromptBuilder {
     const systemParts: string[] = [
       opts.customSystemPrompt || CUBE_QUERY_GRAMMAR,
     ];
+
+    // Add conversation-aware rules when there is conversation history
+    if (opts.conversationHistory && opts.conversationHistory.length > 0) {
+      systemParts.push(CONVERSATION_RULES);
+    }
 
     // Negative patterns (common mistakes to avoid)
     if (opts.negativePatterns && opts.negativePatterns.length > 0) {

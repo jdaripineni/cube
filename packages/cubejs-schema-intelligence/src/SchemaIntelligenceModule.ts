@@ -24,6 +24,7 @@ import type {
   SearchConfig,
 } from './types';
 import { MetricsCollector } from './metrics/MetricsCollector';
+import { ConversationManager } from './conversation/ConversationManager';
 
 /**
  * SchemaIntelligenceModule is the single entry point. When `enabled: false`
@@ -43,6 +44,7 @@ export class SchemaIntelligenceModule {
   private llmProvider: LLMProvider | null = null;
   private feedbackStore: FeedbackStore | null = null;
   private translator: any | null = null; // DefaultTranslator
+  private conversationManager: ConversationManager;
   private metrics: MetricsCollector;
 
   private lastCompilerId: string | null = null;
@@ -61,6 +63,7 @@ export class SchemaIntelligenceModule {
     }
 
     this.metrics = new MetricsCollector();
+    this.conversationManager = new ConversationManager(this.options.conversation);
   }
 
   isEnabled(): boolean {
@@ -69,6 +72,11 @@ export class SchemaIntelligenceModule {
 
   getMetrics(): MetricsCollector {
     return this.metrics;
+  }
+
+  /** Get the conversation manager for multi-turn session handling. */
+  getConversationManager(): ConversationManager {
+    return this.conversationManager;
   }
 
   /**
