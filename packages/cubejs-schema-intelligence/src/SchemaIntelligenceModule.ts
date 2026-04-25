@@ -25,6 +25,7 @@ import type {
 } from './types';
 import { MetricsCollector } from './metrics/MetricsCollector';
 import { ConversationManager } from './conversation/ConversationManager';
+import type { ConversationStore } from './types';
 
 /**
  * SchemaIntelligenceModule is the single entry point. When `enabled: false`
@@ -44,7 +45,7 @@ export class SchemaIntelligenceModule {
   private llmProvider: LLMProvider | null = null;
   private feedbackStore: FeedbackStore | null = null;
   private translator: any | null = null; // DefaultTranslator
-  private conversationManager: ConversationManager;
+  private conversationManager: ConversationManager | null = null;
   private metrics: MetricsCollector;
 
   private lastCompilerId: string | null = null;
@@ -63,7 +64,6 @@ export class SchemaIntelligenceModule {
     }
 
     this.metrics = new MetricsCollector();
-    this.conversationManager = new ConversationManager(this.options.conversation);
   }
 
   isEnabled(): boolean {
@@ -74,9 +74,28 @@ export class SchemaIntelligenceModule {
     return this.metrics;
   }
 
-  /** Get the conversation manager for multi-turn session handling. */
-  getConversationManager(): ConversationManager {
+  /** Get the conversation manager (lazy-initialized with the configured store). */
+  async getConversationManager(): Promise<ConversationManager> {
+    if (!this.conversationManager) {
+      const store = await this.resolveConversationStore();
+      this.conversationManager = new ConversationManager(store, this.options.conversation);
+    }
     return this.conversationManager;
+  }
+
+  private async resolveConversationStore(): Promise<ConversationStore> {
+    const provider = this.options.conversation?.provider || 'memory';
+    switch (provider) {
+      case 'redis': {
+        const { RedisConversationStore } = await import('./conversation/RedisConversationStore');
+        return new RedisConversationStore(this.options.conversation);
+      }
+      case 'memory':
+      default: {
+        const { InMemoryConversationStore } = await import('./conversation/InMemoryConversationStore');
+        return new InMemoryConversationStore(this.options.conversation);
+      }
+    }
   }
 
   /**

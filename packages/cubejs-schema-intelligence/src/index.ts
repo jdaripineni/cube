@@ -69,6 +69,7 @@ export type {
   LLMProvider,
   FeedbackStore,
   SearchStrategy,
+  ConversationStore,
 } from './types';
 
 // ── Built-in Components (for advanced users building custom pipelines) ──
@@ -88,3 +89,5 @@ export { OpenAILLMProvider, OllamaLLMProvider, resolveLLMProvider, MODEL_REGISTR
 export { AgentsConfigLoader } from './config/AgentsConfigLoader';
 export { MetricsCollector } from './metrics/MetricsCollector';
 export { ConversationManager } from './conversation/ConversationManager';
+export { InMemoryConversationStore } from './conversation/InMemoryConversationStore';
+export { RedisConversationStore } from './conversation/RedisConversationStore';

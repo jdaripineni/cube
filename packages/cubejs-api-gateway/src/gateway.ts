@@ -553,22 +553,22 @@ class ApiGateway {
       // - If conversationId is provided, resume that session (history is built server-side)
       // - If conversationHistory is provided without conversationId, use it directly (stateless mode)
       // - If neither, create a new session automatically
-      const convManager = intelligence.getConversationManager();
+      const convManager = await intelligence.getConversationManager();
       let conversationId = reqConversationId;
       let history = conversationHistory;
 
       if (conversationId) {
         // Resume existing session — build history from server-side state
-        const session = convManager.get(conversationId);
+        const session = await convManager.get(conversationId);
         if (session) {
-          history = convManager.buildHistory(conversationId);
+          history = await convManager.buildHistory(conversationId);
         } else {
           // Session expired or invalid — start a new one
-          conversationId = convManager.create(req.context?.securityContext);
+          conversationId = await convManager.create(req.context?.securityContext);
         }
       } else if (!conversationHistory) {
         // No conversationId and no client-supplied history — create a new session
-        conversationId = convManager.create(req.context?.securityContext);
+        conversationId = await convManager.create(req.context?.securityContext);
       }
       // If conversationHistory was provided without conversationId, we use it as-is (stateless mode)
 
@@ -582,7 +582,7 @@ class ApiGateway {
       if (conversationId) {
         result.conversationId = conversationId;
         // Record this turn in the session for future history building
-        convManager.addTurn(conversationId, question, result.query, result.translationId);
+        await convManager.addTurn(conversationId, question, result.query, result.translationId);
       }
 
       // Auto-verify: compile the generated query to SQL to validate it's executable.

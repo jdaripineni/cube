@@ -520,6 +520,49 @@ export interface ConversationConfig {
   maxTurns?: number;
   /** Maximum number of recent turns to include in the LLM prompt. Default: 6. */
   promptHistorySize?: number;
+  /**
+   * Storage backend for conversation sessions.
+   * - `'memory'` (default): In-process `Map`. Fast, but sessions are lost on restart
+   *   and not shared across pods. Suitable for dev/test or single-pod deployments.
+   * - `'redis'`: Redis-backed store. Sessions survive restarts and are shared across
+   *   all CubeJS pods. Requires `ioredis` peer dependency. Recommended for production.
+   */
+  provider?: 'memory' | 'redis';
+  /**
+   * Connection options for the conversation store backend.
+   * - For `redis`: `{ url: 'redis://host:6379', keyPrefix?: 'cube:conv:' }`
+   *   or any options accepted by `ioredis` constructor.
+   */
+  connectionOptions?: Record<string, any>;
+}
+
+/**
+ * Interface for conversation session persistence backends.
+ * Implement this to use a custom store (e.g., DynamoDB, Memcached, PostgreSQL).
+ *
+ * All methods must be safe for concurrent access across multiple pods.
+ * The store is responsible for TTL enforcement — expired sessions should
+ * not be returned by `get()`.
+ *
+ * @example Custom Redis Cluster implementation:
+ * ```ts
+ * class RedisClusterConversationStore implements ConversationStore {
+ *   async get(id: string) { ... }
+ *   async save(session: ConversationSession) { ... }
+ *   async delete(id: string) { ... }
+ *   async shutdown() { ... }
+ * }
+ * ```
+ */
+export interface ConversationStore {
+  /** Retrieve a session by ID. Returns `null` if not found or expired. */
+  get(conversationId: string): Promise<ConversationSession | null>;
+  /** Create or update a session. The store must enforce `maxTurns` trimming. */
+  save(session: ConversationSession): Promise<void>;
+  /** Delete a session. */
+  delete(conversationId: string): Promise<void>;
+  /** Release resources (close connections, stop timers). */
+  shutdown(): Promise<void>;
 }
 
 /** Result returned by the translator after converting NLQ → CubeQuery. */
