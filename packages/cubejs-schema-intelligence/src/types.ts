@@ -89,6 +89,82 @@ export interface SearchOptions {
   scoreThreshold?: number;
   /** Additional metadata filters (provider-specific). */
   filter?: Record<string, any>;
+  /** Pluggable search strategy for query transformation and result re-ranking. */
+  strategy?: SearchStrategy;
+  /** MMR diversity factor (0–1). `0` = max diversity, `1` = max relevance. Default: `1` (pure similarity). */
+  diversityFactor?: number;
+  /** Per-result score adjustment based on metadata. Return a multiplier (e.g. `1.2` to boost 20%). */
+  boostFn?: (result: VectorSearchResult) => number;
+}
+
+// ── Search Strategy ──
+
+/**
+ * Pluggable strategy for customizing vector search behavior.
+ * Operates above the vector store: transforms queries before embedding and
+ * re-ranks results after retrieval. The store itself is a black box.
+ *
+ * All methods are optional — implement only the hooks you need.
+ *
+ * @example MMR diversity re-ranker:
+ * ```ts
+ * const mmrStrategy: SearchStrategy = {
+ *   async rerank(results, query) {
+ *     return maximalMarginalRelevance(results, query, { lambda: 0.7 });
+ *   },
+ * };
+ * ```
+ *
+ * @example HyDE (Hypothetical Document Embeddings):
+ * ```ts
+ * const hydeStrategy: SearchStrategy = {
+ *   async transformQuery(query, llm) {
+ *     const hypothetical = await llm.complete(
+ *       `Generate a cube schema description that would answer: ${query}`
+ *     );
+ *     return [query, hypothetical]; // embed both, search with averaged vector
+ *   },
+ * };
+ * ```
+ */
+export interface SearchStrategy {
+  /** Transform the raw NLQ query into one or more texts to embed.
+   *  Multiple texts are embedded independently and their vectors averaged.
+   *  If omitted, the original query is used as-is. */
+  transformQuery?(query: string, llm?: LLMProvider): Promise<string[]>;
+  /** Re-rank results after initial vector retrieval.
+   *  Receives the full result set and the original query text.
+   *  Must return results in the desired final order. */
+  rerank?(results: VectorSearchResult[], query: string): Promise<VectorSearchResult[]>;
+  /** Filter results based on custom business logic.
+   *  Called after re-ranking. Return `true` to keep a result. */
+  filter?(result: VectorSearchResult, query: string): boolean;
+}
+
+/**
+ * Configuration for search behavior, set at the top level.
+ *
+ * @example Enable MMR diversity:
+ * ```js
+ * search: {
+ *   defaultTopK: 10,
+ *   defaultScoreThreshold: 0.5,
+ *   diversityFactor: 0.7,
+ * }
+ * ```
+ */
+export interface SearchConfig {
+  /** Default number of results to return. Default: `10`. */
+  defaultTopK?: number;
+  /** Default minimum LLM-readiness score. Default: `0.5`. */
+  defaultScoreThreshold?: number;
+  /** Default MMR diversity factor (0–1). `0` = max diversity, `1` = pure similarity. Default: `1`. */
+  diversityFactor?: number;
+  /** Pluggable search strategy instance (query transformation + re-ranking). */
+  strategy?: SearchStrategy;
+  /** Over-retrieve factor: fetch `topK * overRetrieveFactor` from the store,
+   *  then re-rank/filter down to `topK`. Default: `2` when a strategy is set, `1` otherwise. */
+  overRetrieveFactor?: number;
 }
 
 /**
@@ -720,6 +796,8 @@ export interface SchemaIntelligenceOptions {
   translator?: TranslatorConfig;
   /** Feedback store config. See {@link FeedbackConfig}. */
   feedback?: FeedbackConfig;
+  /** Search behavior config (defaults, diversity, custom strategy). See {@link SearchConfig}. */
+  search?: SearchConfig;
   /** Restrict which views/cubes are exposed to the AI endpoints. Default: all cubes. */
   accessibleViews?: string[];
   /** Re-index vectors automatically when the data model is recompiled. Default: `true`. */

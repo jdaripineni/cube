@@ -38,6 +38,7 @@ export type {
   FeedbackConfig,
   VectorStoreConfig,
   DistanceMetricType,
+  SearchConfig,
 } from './types';
 
 // ── Result Types ──
@@ -63,6 +64,7 @@ export type {
   SchemaSerializer,
   LLMProvider,
   FeedbackStore,
+  SearchStrategy,
 } from './types';
 
 // ── Built-in Components (for advanced users building custom pipelines) ──

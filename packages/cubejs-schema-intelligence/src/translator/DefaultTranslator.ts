@@ -17,6 +17,7 @@ import type {
   FeedbackStore,
   SchemaSerializer,
   SearchOptions,
+  SearchConfig,
 } from '../types';
 import { QueryValidator } from '../validation/QueryValidator';
 import { PromptBuilder } from './PromptBuilder';
@@ -41,6 +42,7 @@ export interface DefaultTranslatorDeps {
   feedbackStore: FeedbackStore | null;
   serializer: SchemaSerializer;
   compiledMeta: CubeMetaConfig[];
+  searchConfig?: SearchConfig;
 }
 
 /**
@@ -100,7 +102,11 @@ export class DefaultTranslator {
     const [nlqEmbedding] = await this.deps.embeddingProvider.embed([nlq]);
 
     // Step 2: Retrieve relevant schemas
-    const searchOpts: SearchOptions = { topK: 10, scoreThreshold: 0.5 };
+    const sc = this.deps.searchConfig;
+    const searchOpts: SearchOptions = {
+      topK: sc?.defaultTopK ?? 10,
+      scoreThreshold: sc?.defaultScoreThreshold ?? 0.5,
+    };
     const results = await this.deps.vectorStore.search(nlqEmbedding, searchOpts);
     const relevantCubes = results.map(r => r.metadata.metaJson as unknown as CubeMetaConfig);
 

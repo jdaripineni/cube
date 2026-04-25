@@ -20,6 +20,8 @@ import type {
   VectorSearchResult,
   FeedbackStats,
   CubeQuery,
+  SearchStrategy,
+  SearchConfig,
 } from './types';
 import { MetricsCollector } from './metrics/MetricsCollector';
 
@@ -184,11 +186,100 @@ export class SchemaIntelligenceModule {
     await this.initialize();
 
     const startTime = Date.now();
-    const [embedding] = await this.embeddingProvider!.embed([query]);
-    const results = await this.vectorStore!.search(embedding, { topK, scoreThreshold });
-    this.metrics.recordSearch(Date.now() - startTime);
+    const searchConfig = this.options.search;
+    const strategy = searchConfig?.strategy;
+    const effectiveTopK = topK ?? searchConfig?.defaultTopK ?? 10;
+    const effectiveThreshold = scoreThreshold ?? searchConfig?.defaultScoreThreshold;
 
+    // Step 1: Query transformation (e.g. HyDE, query expansion)
+    let textsToEmbed = [query];
+    if (strategy?.transformQuery) {
+      textsToEmbed = await strategy.transformQuery(query, this.llmProvider || undefined);
+    }
+
+    // Step 2: Embed (multiple texts are averaged)
+    const embeddings = await this.embeddingProvider!.embed(textsToEmbed);
+    const embedding = embeddings.length === 1
+      ? embeddings[0]
+      : embeddings[0].map((_, i) => embeddings.reduce((sum, e) => sum + e[i], 0) / embeddings.length);
+
+    // Step 3: Over-retrieve when a strategy is set (to give re-ranker more candidates)
+    const overFactor = searchConfig?.overRetrieveFactor ?? (strategy ? 2 : 1);
+    const retrieveK = Math.ceil(effectiveTopK * overFactor);
+    let results = await this.vectorStore!.search(embedding, {
+      topK: retrieveK,
+      scoreThreshold: effectiveThreshold,
+    });
+
+    // Step 4: Apply diversity factor (MMR-style)
+    const diversityFactor = searchConfig?.diversityFactor ?? 1;
+    if (diversityFactor < 1 && results.length > 1) {
+      results = this.applyMMR(results, embedding, diversityFactor, effectiveTopK);
+    }
+
+    // Step 5: Custom re-ranking
+    if (strategy?.rerank) {
+      results = await strategy.rerank(results, query);
+    }
+
+    // Step 6: Custom filtering
+    if (strategy?.filter) {
+      results = results.filter(r => strategy.filter!(r, query));
+    }
+
+    // Step 7: Trim to requested topK
+    results = results.slice(0, effectiveTopK);
+
+    this.metrics.recordSearch(Date.now() - startTime);
     return results;
+  }
+
+  /**
+   * Maximal Marginal Relevance: balance relevance (similarity to query) with
+   * diversity (dissimilarity to already-selected results).
+   */
+  private applyMMR(
+    results: VectorSearchResult[],
+    queryEmbedding: number[],
+    lambda: number,
+    k: number,
+  ): VectorSearchResult[] {
+    const selected: VectorSearchResult[] = [];
+    const remaining = [...results];
+
+    while (selected.length < k && remaining.length > 0) {
+      let bestIdx = 0;
+      let bestScore = -Infinity;
+
+      for (let i = 0; i < remaining.length; i++) {
+        const relevance = remaining[i].similarity;
+        let maxSimilarityToSelected = 0;
+        for (const sel of selected) {
+          const sim = this.cosineSim(remaining[i].embedding, sel.embedding);
+          if (sim > maxSimilarityToSelected) maxSimilarityToSelected = sim;
+        }
+        const mmrScore = lambda * relevance - (1 - lambda) * maxSimilarityToSelected;
+        if (mmrScore > bestScore) {
+          bestScore = mmrScore;
+          bestIdx = i;
+        }
+      }
+
+      selected.push(remaining.splice(bestIdx, 1)[0]);
+    }
+
+    return selected;
+  }
+
+  private cosineSim(a: number[], b: number[]): number {
+    let dot = 0, normA = 0, normB = 0;
+    for (let i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+    const denom = Math.sqrt(normA) * Math.sqrt(normB);
+    return denom === 0 ? 0 : dot / denom;
   }
 
   async getScores(cubeName?: string): Promise<ScoreResult[]> {
@@ -225,6 +316,7 @@ export class SchemaIntelligenceModule {
         feedbackStore: this.feedbackStore,
         serializer: this.serializer!,
         compiledMeta: this.compiledMeta,
+        searchConfig: this.options.search,
       });
     }
 

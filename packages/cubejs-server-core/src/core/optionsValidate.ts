@@ -203,6 +203,14 @@ const schemaOptions = Joi.object().keys({
         enabled: Joi.boolean(),
         dbPath: Joi.string(),
       }),
+      // Search behavior: defaults, diversity, over-retrieve factor
+      search: Joi.object().keys({
+        defaultTopK: Joi.number().integer().min(1),
+        defaultScoreThreshold: Joi.number().min(0).max(1),
+        diversityFactor: Joi.number().min(0).max(1),
+        overRetrieveFactor: Joi.number().min(1),
+        // strategy is a runtime object — not validated by Joi
+      }),
       // Expose Prometheus metrics at /v1/ai/metrics
       metrics: Joi.boolean(),
     })
