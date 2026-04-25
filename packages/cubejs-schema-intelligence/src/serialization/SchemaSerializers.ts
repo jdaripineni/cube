@@ -13,7 +13,29 @@ const DEFAULT_OPTIONS: SerializeOptions = {
   includeSql: false,
 };
 
+/**
+ * Token-optimized compact serializer for LLM context windows.
+ * Produces a human-readable one-line-per-cube format that minimizes token usage
+ * while preserving measure names, types, descriptions, and joins.
+ *
+ * @example Output format:
+ * ```
+ * Orders: Online sales data — measures[totalAmount(sum, Total order amount); orderCount(count)], dimensions[status(string, Values: active, cancelled)]
+ * ```
+ *
+ * @example Usage:
+ * ```ts
+ * const serializer = new CompactSerializer();
+ * const text = serializer.serialize(cubes, { maxTokens: 4000 });
+ * ```
+ */
 export class CompactSerializer implements SchemaSerializer {
+  /**
+   * Serialize cubes into compact text.
+   * @param cubes - Array of cube metadata.
+   * @param options - Optional. `maxTokens` trims output to fit LLM context windows.
+   *   `includeJoins` (default: `true`), `includePreAggs` (default: `false`).
+   */
   serialize(cubes: CubeMetaConfig[], options?: Partial<SerializeOptions>): string {
     const opts = { ...DEFAULT_OPTIONS, ...options };
     const lines: string[] = [];
@@ -76,7 +98,17 @@ export class CompactSerializer implements SchemaSerializer {
   }
 }
 
+/**
+ * Full JSON serializer — produces structured JSON output of cube schemas.
+ * More verbose than {@link CompactSerializer} but preserves exact structure
+ * for LLMs that work better with JSON input.
+ */
 export class FullJsonSerializer implements SchemaSerializer {
+  /**
+   * Serialize cubes into formatted JSON.
+   * @param cubes - Array of cube metadata.
+   * @param options - Optional. `maxTokens` truncates JSON if too large.
+   */
   serialize(cubes: CubeMetaConfig[], options?: Partial<SerializeOptions>): string {
     const opts = { ...DEFAULT_OPTIONS, ...options };
     const simplified = cubes.map(c => {

@@ -6,17 +6,39 @@
 
 import type { EmbeddingProvider, EmbeddingConfig } from '../types';
 
+/**
+ * Embedding provider for self-hosted Ollama instances.
+ * Calls the native Ollama `/api/embed` endpoint (not OpenAI-compatible `/v1`).
+ *
+ * @example
+ * ```ts
+ * const provider = new OllamaEmbeddingProvider({
+ *   provider: 'ollama',
+ *   model: 'nomic-embed-text',           // default
+ *   endpoint: 'http://localhost:11434',   // default
+ * });
+ * const vectors = await provider.embed(['What is revenue?']);
+ * // vectors[0].length === 768
+ * ```
+ */
 export class OllamaEmbeddingProvider implements EmbeddingProvider {
   private model: string;
   private endpoint: string;
   private dimCount: number;
 
+  /**
+   * @param config - Embedding configuration.
+   *   `config.model` defaults to `'nomic-embed-text'`.
+   *   `config.endpoint` defaults to `'http://localhost:11434'`.
+   *   `config.dimensions` defaults to `768`.
+   */
   constructor(config: EmbeddingConfig) {
     this.model = config.model || 'nomic-embed-text';
     this.endpoint = config.endpoint || 'http://localhost:11434';
     this.dimCount = config.dimensions || 768;
   }
 
+  /** Embed one or more texts into vectors via Ollama's `/api/embed` endpoint. */
   async embed(texts: string[]): Promise<number[][]> {
     const results: number[][] = [];
 
@@ -47,6 +69,7 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
     return results;
   }
 
+  /** Returns the dimensionality of the embedding vectors (e.g. 768 for nomic-embed-text). */
   dimensions(): number {
     return this.dimCount;
   }

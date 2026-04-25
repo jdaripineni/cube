@@ -39,6 +39,32 @@ module.exports = {
 };
 ```
 
+### Self-hosted with Ollama
+
+Run the full AI pipeline locally with no external API keys:
+
+```js
+module.exports = {
+  schemaIntelligence: {
+    scoring: true,
+    embedding: {
+      provider: 'ollama',
+      model: 'nomic-embed-text',         // default; any Ollama embedding model works
+      endpoint: 'http://localhost:11434', // Ollama native API (not /v1)
+    },
+    vectorStore: { provider: 'memory' },
+    translator: { enabled: true },
+    llm: {
+      provider: 'ollama',
+      model: 'qwen3:0.6b',              // or llama3, mistral, etc.
+      baseUrl: 'http://localhost:11434/v1', // OpenAI-compatible endpoint
+    },
+    feedback: { enabled: true },
+    metrics: true,
+  },
+};
+```
+
 ## Feature Gate
 
 All features are gated behind the `schemaIntelligence` option. When disabled (default):
@@ -101,9 +127,20 @@ the data model is recompiled, so this is only needed if you want to trigger it m
 
 | Provider | Model | Dimensions | Requires |
 |----------|-------|-----------|----------|
-| `local` | all-MiniLM-L6-v2 | 384 | Nothing (bundled) |
-| `openai` | text-embedding-3-small | 1536 | `OPENAI_API_KEY` |
-| `ollama` | nomic-embed-text | 768 | Ollama running locally |
+| `local` | all-MiniLM-L6-v2 | 384 | `@xenova/transformers` (bundled in Cube Cloud) |
+| `openai` | text-embedding-3-small | 1536 | `apiKey` (or `OPENAI_API_KEY`) |
+| `ollama` | nomic-embed-text | 768 | Ollama running at `endpoint` (default `http://localhost:11434`) |
+
+### Embedding config reference
+
+```js
+embedding: {
+  provider: 'ollama',           // required: 'local' | 'openai' | 'ollama'
+  model: 'nomic-embed-text',    // optional: override default model
+  endpoint: 'http://...:11434', // optional: Ollama host (native API, not /v1)
+  apiKey: '...',                // optional: for OpenAI
+}
+```
 
 ## Vector Store Providers
 
@@ -146,6 +183,21 @@ CUBEJS_AI_LLM_PROVIDER=openai
 CUBEJS_AI_LLM_API_KEY=<your-key>
 CUBEJS_AI_LLM_MODEL=gpt-4o-mini
 ```
+
+### Ollama (self-hosted)
+
+```bash
+CUBEJS_SCHEMA_INTELLIGENCE=true
+CUBEJS_AI_EMBEDDING_PROVIDER=ollama
+CUBEJS_AI_LLM_PROVIDER=ollama
+CUBEJS_AI_LLM_MODEL=qwen3:0.6b
+CUBEJS_AI_LLM_BASE_URL=http://ollama:11434/v1
+```
+
+> **Note:** The `embedding.endpoint` uses Ollama's native `/api/embed` API (without `/v1`),
+> while `llm.baseUrl` uses the OpenAI-compatible `/v1` endpoint. When configured via
+> `CUBEJS_AI_LLM_BASE_URL`, the embedding endpoint is derived automatically by stripping
+> the `/v1` suffix.
 
 ## Architecture
 

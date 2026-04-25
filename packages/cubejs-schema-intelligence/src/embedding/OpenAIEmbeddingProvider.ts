@@ -6,6 +6,21 @@
 
 import type { EmbeddingProvider, EmbeddingConfig } from '../types';
 
+/**
+ * Embedding provider using the OpenAI Embeddings API.
+ * Supports `text-embedding-3-small`, `text-embedding-3-large`, and `text-embedding-ada-002`.
+ *
+ * @example
+ * ```ts
+ * const provider = new OpenAIEmbeddingProvider({
+ *   provider: 'openai',
+ *   apiKey: process.env.OPENAI_API_KEY!,
+ *   model: 'text-embedding-3-small',  // default
+ * });
+ * const vectors = await provider.embed(['show revenue by region']);
+ * // vectors[0].length === 1536
+ * ```
+ */
 export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   private apiKey: string;
   private model: string;
@@ -13,6 +28,14 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   private endpoint: string;
   private batchSize: number;
 
+  /**
+   * @param config - Embedding configuration. `apiKey` is required.
+   *   `config.model` defaults to `'text-embedding-3-small'`.
+   *   `config.dimensions` defaults to `1536`.
+   *   `config.endpoint` defaults to `'https://api.openai.com/v1/embeddings'`.
+   *   `config.batchSize` defaults to `100`.
+   * @throws Error if `apiKey` is not provided.
+   */
   constructor(config: EmbeddingConfig) {
     if (!config.apiKey) {
       throw new Error('OpenAI embedding provider requires apiKey');
@@ -24,9 +47,9 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     this.batchSize = config.batchSize || 100;
   }
 
+  /** Embed texts in batches via the OpenAI API. Returns one vector per input text. */
   async embed(texts: string[]): Promise<number[][]> {
     const results: number[][] = [];
-
     for (let i = 0; i < texts.length; i += this.batchSize) {
       const batch = texts.slice(i, i + this.batchSize);
       const resp = await fetch(this.endpoint, {

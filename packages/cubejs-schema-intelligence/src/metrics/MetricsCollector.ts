@@ -6,6 +6,20 @@
 
 import type { IntelligenceMetrics } from '../types';
 
+/**
+ * Collects Prometheus-compatible metrics for schema intelligence operations.
+ * Tracks indexing, search, translation, embedding API calls, and user feedback.
+ *
+ * Access via `GET /v1/ai/metrics` (text format) or `GET /v1/ai/status` (JSON).
+ *
+ * @example Prometheus text output:
+ * ```
+ * cubejs_ai_index_cubes_total 150
+ * cubejs_ai_translate_requests_total 42
+ * cubejs_ai_translate_success_rate 0.857
+ * cubejs_ai_feedback_total{type="positive"} 30
+ * ```
+ */
 export class MetricsCollector implements IntelligenceMetrics {
   indexedCubesTotal = 0;
   indexedCubesConsumable = 0;
@@ -24,6 +38,7 @@ export class MetricsCollector implements IntelligenceMetrics {
 
   private translateSuccessCount = 0;
 
+  /** Record a vector search operation with its latency. */
   recordSearch(latencyMs: number): void {
     this.searchRequestsTotal++;
     this.searchLatencyMs.push(latencyMs);
@@ -32,6 +47,7 @@ export class MetricsCollector implements IntelligenceMetrics {
     }
   }
 
+  /** Record a translation attempt (success or failure). Updates success rate. */
   recordTranslation(success: boolean): void {
     this.translateRequestsTotal++;
     if (success) this.translateSuccessCount++;
@@ -40,12 +56,14 @@ export class MetricsCollector implements IntelligenceMetrics {
       : 0;
   }
 
+  /** Record a reindex operation with total cubes and consumable count. */
   recordIndex(total: number, consumable: number): void {
     this.indexedCubesTotal = total;
     this.indexedCubesConsumable = consumable;
     this.indexLastUpdated = new Date();
   }
 
+  /** Record user feedback by type. */
   recordFeedback(rating: 'positive' | 'negative' | 'corrected'): void {
     switch (rating) {
       case 'positive': this.feedbackPositive++; break;
@@ -54,6 +72,7 @@ export class MetricsCollector implements IntelligenceMetrics {
     }
   }
 
+  /** Export metrics in Prometheus text exposition format. */
   toPrometheus(): string {
     const lines: string[] = [];
     const ts = Date.now();
@@ -94,6 +113,7 @@ export class MetricsCollector implements IntelligenceMetrics {
     return lines.join('\n') + '\n';
   }
 
+  /** Export metrics as a JSON object (used by `/v1/ai/status`). */
   toJSON(): Record<string, any> {
     return {
       indexedCubesTotal: this.indexedCubesTotal,

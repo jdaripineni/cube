@@ -75,7 +75,7 @@ export class AgentsConfigLoader {
     const result: Partial<SchemaIntelligenceOptions> = {};
 
     if (config.embedding_llm) {
-      result.embeddingLlm = typeof config.embedding_llm === 'string'
+      result.embedding = typeof config.embedding_llm === 'string'
         ? config.embedding_llm
         : config.embedding_llm as any;
     }

@@ -26,8 +26,30 @@ const INDEX_OPS_MAP: Record<string, string> = {
   manhattan: 'vector_l1_ops',
 };
 
+/**
+ * PostgreSQL vector store backed by the `pgvector` extension.
+ * Provides persistent, indexed vector search for production deployments.
+ *
+ * Requires:
+ * - PostgreSQL with `pgvector` extension installed
+ * - `pg` npm package: `npm install pg`
+ *
+ * @example
+ * ```ts
+ * const store = new PgVectorStore({
+ *   provider: 'pgvector',
+ *   connectionOptions: {
+ *     connectionString: 'postgresql://user:pass@host:5432/cubeai',
+ *   },
+ *   distanceMetric: 'cosine',  // default
+ *   indexType: 'hnsw',         // default; also 'ivfflat' or 'flat'
+ * });
+ * await store.initialize(); // creates table + index if not exists
+ * ```
+ */
 export class PgVectorStore implements VectorStore {
   private pool: any;
+  private pg: any;
   private config: VectorStoreConfig;
   private tableName = 'cube_schema_embeddings';
   private operator: string;
@@ -40,16 +62,20 @@ export class PgVectorStore implements VectorStore {
     this.indexOps = INDEX_OPS_MAP[metric] || 'vector_cosine_ops';
   }
 
+  /**
+   * Create the `cube_schema_embeddings` table and vector index if they don't exist.
+   * Must be called before any other operations.
+   * @throws Error if `pg` is not installed.
+   */
   async initialize(): Promise<void> {
-    let pg: any;
     try {
-      pg = await import('pg');
+      this.pg = await import('pg');
     } catch {
       throw new Error('pgvector store requires pg. Install it: npm install pg');
     }
 
     const connOpts = this.config.connectionOptions || {};
-    this.pool = new pg.default.Pool({
+    this.pool = new this.pg.default.Pool({
       connectionString: connOpts.connectionString,
       ...connOpts,
       max: connOpts.maxPoolSize || 5,
@@ -94,6 +120,7 @@ export class PgVectorStore implements VectorStore {
     }
   }
 
+  /** Insert or update records using `ON CONFLICT ... DO UPDATE`. */
   async upsert(records: VectorRecord[]): Promise<void> {
     const client = await this.pool.connect();
     try {
@@ -114,6 +141,7 @@ export class PgVectorStore implements VectorStore {
     }
   }
 
+  /** Find the `topK` nearest vectors using the configured distance operator. */
   async search(queryEmbedding: number[], opts: SearchOptions): Promise<VectorSearchResult[]> {
     const vecStr = `[${queryEmbedding.join(',')}]`;
     let whereClause = '';

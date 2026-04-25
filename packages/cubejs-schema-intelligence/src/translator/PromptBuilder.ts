@@ -39,7 +39,20 @@ export interface PromptBuildOptions {
   customSystemPrompt?: string;
 }
 
+/**
+ * Constructs LLM prompts for NLQ translation with schema context, few-shot examples,
+ * negative patterns (common mistakes), and self-healing error feedback.
+ *
+ * The system prompt contains the Cube.js query grammar rules.
+ * The user prompt assembles: examples → schemas → history → errors → question.
+ */
 export class PromptBuilder {
+  /**
+   * Build a system + user prompt pair for the LLM.
+   * @param opts - Prompt build options including the NLQ, serialized schemas,
+   *   conversation history, few-shot examples, and any previous validation errors.
+   * @returns `{ systemPrompt, userPrompt }` ready to pass to an LLM provider.
+   */
   build(opts: PromptBuildOptions): { systemPrompt: string; userPrompt: string } {
     const systemParts: string[] = [
       opts.customSystemPrompt || CUBE_QUERY_GRAMMAR,

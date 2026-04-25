@@ -14,25 +14,56 @@ import type {
   FeedbackConfig,
 } from '../types';
 
+/**
+ * SQLite-backed feedback store for tracking NLQ translation quality.
+ * Stores every translation attempt and user feedback (positive/negative/corrected).
+ * Positive examples are reused as few-shot prompts for future translations.
+ *
+ * Requires `better-sqlite3` as a peer dependency:
+ * ```bash
+ * npm install better-sqlite3
+ * ```
+ *
+ * @example In-memory (default, for dev/test):
+ * ```ts
+ * const store = new SqliteFeedbackStore();
+ * await store.initialize();
+ * ```
+ *
+ * @example Persistent file:
+ * ```ts
+ * const store = new SqliteFeedbackStore({
+ *   enabled: true,
+ *   connectionOptions: { path: '/data/cube-feedback.db' },
+ * });
+ * await store.initialize();
+ * ```
+ */
 export class SqliteFeedbackStore implements FeedbackStore {
   private db: any;
   private config: FeedbackConfig;
+
+  // Late-bound: loaded dynamically in initialize()
+  private BetterSqlite3: any;
 
   constructor(config?: FeedbackConfig) {
     this.config = config || {};
     this.db = null;
   }
 
+  /**
+   * Open the SQLite database and create the `feedback` table + indexes if not present.
+   * @throws Error if `better-sqlite3` is not installed.
+   */
   async initialize(): Promise<void> {
-    let BetterSqlite3: any;
     try {
-      BetterSqlite3 = (await import('better-sqlite3')).default;
+      this.BetterSqlite3 = (await import('better-sqlite3')).default;
     } catch {
       throw new Error('SQLite feedback store requires better-sqlite3. Install it: npm install better-sqlite3');
     }
 
     const dbPath = this.config.connectionOptions?.path || ':memory:';
-    this.db = new BetterSqlite3(dbPath);
+    this.db = new this.BetterSqlite3(dbPath);
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS feedback (
@@ -57,6 +88,7 @@ export class SqliteFeedbackStore implements FeedbackStore {
     `);
   }
 
+  /** Save a translation attempt (generated query, schemas used, latency, etc.). */
   async save(entry: FeedbackEntry): Promise<void> {
     const stmt = this.db.prepare(`
       INSERT OR REPLACE INTO feedback
@@ -81,6 +113,7 @@ export class SqliteFeedbackStore implements FeedbackStore {
     );
   }
 
+  /** Update the rating for a previously saved translation. Optionally attach a corrected query. */
   async submitFeedback(translationId: string, rating: 'positive' | 'negative' | 'corrected', correctedQuery?: CubeQuery): Promise<void> {
     const stmt = this.db.prepare(`
       UPDATE feedback SET rating = ?, corrected_query = ? WHERE translation_id = ?
@@ -88,6 +121,7 @@ export class SqliteFeedbackStore implements FeedbackStore {
     stmt.run(rating, correctedQuery ? JSON.stringify(correctedQuery) : null, translationId);
   }
 
+  /** Retrieve recent positively-rated translations for use as few-shot examples. */
   async getPositiveExamples(opts: ExampleQueryOptions): Promise<FeedbackEntry[]> {
     const limit = opts.topK || 5;
     const minRating = opts.minRating || 'positive';
@@ -103,6 +137,7 @@ export class SqliteFeedbackStore implements FeedbackStore {
     return rows.map((r: any) => this.rowToEntry(r));
   }
 
+  /** Get recurring error patterns from negative feedback (for LLM "mistakes to avoid" prompts). */
   async getNegativePatterns(): Promise<NegativePattern[]> {
     const rows = this.db.prepare(`
       SELECT execution_error as pattern, COUNT(*) as count, MAX(timestamp) as last_seen
@@ -120,6 +155,7 @@ export class SqliteFeedbackStore implements FeedbackStore {
     }));
   }
 
+  /** Compute aggregate statistics: success/failure rates, average latency, retry stats. */
   async getStats(): Promise<FeedbackStats> {
     const total = this.db.prepare('SELECT COUNT(*) as cnt FROM feedback').get().cnt;
     if (total === 0) {

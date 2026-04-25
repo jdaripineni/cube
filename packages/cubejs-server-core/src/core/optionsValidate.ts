@@ -149,33 +149,48 @@ const schemaOptions = Joi.object().keys({
   serverless: Joi.boolean(),
   allowNodeRequire: Joi.boolean(),
   fastReload: Joi.boolean(),
-  // AI schema intelligence
+  // AI schema intelligence — feature-gated module for scoring, vector search,
+  // and NLQ translation. See @cubejs-backend/schema-intelligence for full docs.
+  //
+  // Quick start:  schemaIntelligence: true
+  // Full config:  schemaIntelligence: { scoring: true, embedding: { provider: 'ollama' }, ... }
+  //
+  // All sub-keys are optional. Omitted keys use sensible defaults.
   schemaIntelligence: Joi.alternatives().try(
     Joi.boolean(),
     Joi.object().keys({
+      // Scoring engine: true for defaults, or { threshold, criteria } for custom weights
       scoring: Joi.alternatives().try(Joi.boolean(), Joi.object().keys({
         criteria: Joi.object().pattern(Joi.string(), Joi.object().keys({
           weight: Joi.number().min(0).max(1),
           description: Joi.string(),
         })),
       })),
+      // Embedding provider: 'local' (default), 'openai', or 'ollama'
+      // endpoint = Ollama native URL (e.g. http://ollama:11434), NOT /v1
+      // baseUrl  = OpenAI-compatible URL (kept for parity with llm section)
       embedding: Joi.object().keys({
         provider: Joi.string().valid('local', 'openai', 'ollama'),
         apiKey: Joi.string(),
         model: Joi.string(),
         baseUrl: Joi.string(),
+        endpoint: Joi.string(),
       }),
+      // Vector store: 'memory' (default, dev/test) or 'pgvector' (production)
       vectorStore: Joi.object().keys({
         provider: Joi.string().valid('memory', 'pgvector'),
         connectionString: Joi.string(),
         dimensions: Joi.number().integer().min(1),
       }),
+      // NLQ translator: requires llm section to also be configured
       translator: Joi.object().keys({
         enabled: Joi.boolean(),
         maxRetries: Joi.number().integer().min(0),
         maxContextSchemas: Joi.number().integer().min(1),
         fewShotCount: Joi.number().integer().min(0),
       }),
+      // LLM provider for NLQ translation: 'openai' or 'ollama'
+      // baseUrl = OpenAI-compatible endpoint (e.g. http://ollama:11434/v1)
       llm: Joi.object().keys({
         provider: Joi.string().valid('openai', 'ollama'),
         apiKey: Joi.string(),
@@ -183,10 +198,12 @@ const schemaOptions = Joi.object().keys({
         baseUrl: Joi.string(),
         temperature: Joi.number().min(0).max(2),
       }),
+      // Feedback store for continuous improvement via user ratings
       feedback: Joi.object().keys({
         enabled: Joi.boolean(),
         dbPath: Joi.string(),
       }),
+      // Expose Prometheus metrics at /v1/ai/metrics
       metrics: Joi.boolean(),
     })
   ),

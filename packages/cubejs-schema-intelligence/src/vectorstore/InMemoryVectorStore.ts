@@ -69,24 +69,43 @@ function getSimilarityFn(metric: DistanceMetricType): SimilarityFn {
   }
 }
 
+/**
+ * In-memory vector store using brute-force k-nearest-neighbor search.
+ * Best for development, testing, and small deployments (<5K vectors).
+ * Data is lost on restart — use {@link PgVectorStore} for persistence.
+ *
+ * @example
+ * ```ts
+ * const store = new InMemoryVectorStore(); // cosine similarity by default
+ * await store.initialize();
+ * await store.upsert([{ id: 'Orders', embedding: [...], metadata: { ... } }]);
+ * const results = await store.search(queryVector, { topK: 5 });
+ * ```
+ */
 export class InMemoryVectorStore implements VectorStore {
   private records: Map<string, VectorRecord> = new Map();
   private similarityFn: SimilarityFn;
 
+  /**
+   * @param config - Optional store configuration.
+   *   `config.distanceMetric` defaults to `'cosine'`. Also supports `'euclidean'`, `'dot_product'`, `'manhattan'`.
+   */
   constructor(config?: VectorStoreConfig) {
     this.similarityFn = getSimilarityFn(config?.distanceMetric || 'cosine');
   }
 
+  /** No-op for in-memory store. */
   async initialize(): Promise<void> {
-    // No-op for in-memory
   }
 
+  /** Insert or update records. Existing records with the same `id` are overwritten. */
   async upsert(records: VectorRecord[]): Promise<void> {
     for (const record of records) {
       this.records.set(record.id, record);
     }
   }
 
+  /** Find the `topK` most similar vectors. Optionally filter by `scoreThreshold`. */
   async search(queryEmbedding: number[], opts: SearchOptions): Promise<VectorSearchResult[]> {
     const scored: VectorSearchResult[] = [];
 

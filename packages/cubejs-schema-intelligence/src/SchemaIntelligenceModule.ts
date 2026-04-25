@@ -258,9 +258,9 @@ export class SchemaIntelligenceModule {
       enabled: true,
       initialized: this.initialized,
       vectorStoreProvider: this.options.vectorStore?.provider || 'inmemory',
-      embeddingProvider: typeof this.options.embeddingLlm === 'string'
-        ? this.options.embeddingLlm
-        : (this.options.embeddingLlm as any)?.provider || 'local',
+      embeddingProvider: typeof this.options.embedding === 'string'
+        ? this.options.embedding
+        : (this.options.embedding as any)?.provider || 'local',
       translatorEnabled: !!this.llmProvider,
       feedbackEnabled: !!this.feedbackStore,
       indexedCubes: count,
@@ -280,7 +280,7 @@ export class SchemaIntelligenceModule {
   // ── Private Factory Methods ──
 
   private async createEmbeddingProvider(): Promise<EmbeddingProvider> {
-    const config = this.options.embeddingLlm;
+    const config = this.options.embedding;
 
     if (!config || config === 'local') {
       const { LocalEmbeddingProvider } = await import('./embedding/LocalEmbeddingProvider');

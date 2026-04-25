@@ -143,10 +143,43 @@ function generateSuggestions(cube: CubeMetaConfig, scoreDimensions: Record<strin
 
 // ── Scorer ──
 
+/**
+ * Rule-based scorer that evaluates cube schema quality for LLM consumption.
+ * Each cube gets a 0–1 score based on weighted criteria (descriptions, types, enums, etc.).
+ * Cubes scoring above the threshold are marked `consumable`.
+ *
+ * @example
+ * ```ts
+ * const scorer = new RuleBasedScorer(); // default criteria + 0.7 threshold
+ * const result = scorer.score(cubeMetaConfig);
+ * console.log(result.overall);      // 0.85
+ * console.log(result.consumable);   // true
+ * console.log(result.suggestions);  // [{issue: 'missing_description', ...}]
+ * ```
+ *
+ * @example Custom criteria weights:
+ * ```ts
+ * const scorer = new RuleBasedScorer({
+ *   threshold: 0.6,
+ *   criteria: [
+ *     { name: 'measure_descriptions', weight: 0.5 },
+ *     { name: 'dimension_descriptions', weight: 0.5 },
+ *   ],
+ * });
+ * ```
+ */
 export class RuleBasedScorer implements ScoringStrategy {
   private criteria: ScoringCriterion[];
   private threshold: number;
 
+  /**
+   * @param config - Optional scoring configuration.
+   *   `config.threshold` — minimum score for a cube to be "consumable". Default: `0.7`.
+   *   `config.criteria` — override default criteria and weights.
+   *     Available criteria: `cube_description`, `measure_descriptions`, `dimension_descriptions`,
+   *     `type_coverage`, `enum_values_listed`, `datasource_explicit`, `join_descriptions`.
+   * @throws Error if an unknown criterion name is provided.
+   */
   constructor(config?: ScoringConfig) {
     this.threshold = config?.threshold ?? 0.7;
 
@@ -169,6 +202,11 @@ export class RuleBasedScorer implements ScoringStrategy {
     }
   }
 
+  /**
+   * Score a single cube's metadata for LLM readiness.
+   * @param cube - Cube metadata from schema compilation.
+   * @returns Score result with `overall` (0–1), per-criterion `dimensions`, `consumable` flag, and `suggestions`.
+   */
   score(cube: CubeMetaConfig): ScoreResult {
     const dimensions: Record<string, number> = {};
     let overall = 0;

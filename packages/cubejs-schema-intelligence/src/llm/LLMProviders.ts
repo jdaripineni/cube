@@ -28,11 +28,31 @@ const MODEL_REGISTRY: Record<string, { provider: string; model: string }> = {
 
 // ── OpenAI LLM Provider ──
 
+/**
+ * OpenAI LLM provider using the Chat Completions API.
+ * Works with any OpenAI-compatible endpoint (OpenAI, Azure OpenAI, LiteLLM, etc.).
+ *
+ * @example
+ * ```ts
+ * const llm = new OpenAILLMProvider({
+ *   provider: 'openai',
+ *   apiKey: process.env.OPENAI_API_KEY!,
+ *   model: 'gpt-4o-mini',  // default
+ * });
+ * const answer = await llm.complete('Translate: show revenue by month');
+ * ```
+ */
 export class OpenAILLMProvider implements LLMProvider {
   private apiKey: string;
   private model: string;
   private endpoint: string;
 
+  /**
+   * @param config - LLM configuration. `apiKey` is required.
+   *   `config.model` defaults to `'gpt-4o-mini'`.
+   *   `config.endpoint` defaults to `'https://api.openai.com/v1/chat/completions'`.
+   * @throws Error if `apiKey` is not provided.
+   */
   constructor(config: LLMConfig) {
     if (!config.apiKey) throw new Error('OpenAI LLM provider requires apiKey');
     this.apiKey = config.apiKey;
@@ -40,6 +60,7 @@ export class OpenAILLMProvider implements LLMProvider {
     this.endpoint = config.endpoint || 'https://api.openai.com/v1/chat/completions';
   }
 
+  /** Send a prompt and return the LLM's text response. */
   async complete(prompt: string, options?: CompletionOptions): Promise<string> {
     const messages: any[] = [];
     if (options?.systemPrompt) {
@@ -70,12 +91,10 @@ export class OpenAILLMProvider implements LLMProvider {
     return json.choices[0].message.content;
   }
 
+  /** Send a prompt and parse the response as JSON matching `jsonSchema`. */
   async completeStructured<T = any>(prompt: string, jsonSchema: Record<string, any>, options?: CompletionOptions): Promise<T> {
-    const structuredPrompt = `${prompt}\n\nRespond ONLY with valid JSON matching this schema:\n${JSON.stringify(jsonSchema, null, 2)}\n\nJSON response:`;
-    const result = await this.complete(structuredPrompt, { ...options, temperature: options?.temperature ?? 0.05 });
-
-    // Extract JSON from response (handle markdown code blocks)
-    let jsonStr = result.trim();
+    const schemaPrompt = `${prompt}\n\nRespond with valid JSON matching this schema:\n${JSON.stringify(jsonSchema, null, 2)}`;
+    let jsonStr = await this.complete(schemaPrompt, options);
     if (jsonStr.startsWith('```')) {
       jsonStr = jsonStr.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
     }
@@ -90,10 +109,29 @@ export class OpenAILLMProvider implements LLMProvider {
 
 // ── Ollama LLM Provider ──
 
+/**
+ * Ollama LLM provider using the native `/api/chat` endpoint.
+ * For self-hosted LLM inference with models like llama3, mistral, qwen, etc.
+ *
+ * @example
+ * ```ts
+ * const llm = new OllamaLLMProvider({
+ *   provider: 'ollama',
+ *   model: 'qwen3:0.6b',
+ *   endpoint: 'http://localhost:11434',  // default
+ * });
+ * const answer = await llm.complete('Translate: show revenue by month');
+ * ```
+ */
 export class OllamaLLMProvider implements LLMProvider {
   private model: string;
   private endpoint: string;
 
+  /**
+   * @param config - LLM configuration.
+   *   `config.model` defaults to `'llama3.1'`.
+   *   `config.endpoint` defaults to `'http://localhost:11434'`.
+   */
   constructor(config: LLMConfig) {
     this.model = config.model || 'llama3.1';
     this.endpoint = config.endpoint || 'http://localhost:11434';
@@ -148,6 +186,14 @@ export class OllamaLLMProvider implements LLMProvider {
 
 // ── Resolver ──
 
+/**
+ * Resolve an LLM provider from configuration. Tries in order:
+ * 1. Explicit object config (`{ provider: 'openai', apiKey: ... }`)
+ * 2. Predefined model name string (`'gpt_4o'`, `'claude_4_sonnet'`)
+ * 3. Auto-detect local Ollama (probes `http://localhost:11434/api/tags`)
+ * 4. API key env vars (`CUBEJS_LLM_API_KEY` or `OPENAI_API_KEY`)
+ * 5. Returns `null` if no LLM is available.
+ */
 export async function resolveLLMProvider(config?: TranslatorConfig): Promise<LLMProvider | null> {
   const llmConfig = config?.llm;
 

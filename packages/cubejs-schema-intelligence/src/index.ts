@@ -1,14 +1,47 @@
 /**
  * @license Apache-2.0
  * @copyright Cube Dev, Inc.
- * @fileoverview Public API for @cubejs-backend/schema-intelligence.
+ * @fileoverview Public API for `@cubejs-backend/schema-intelligence`.
+ *
+ * ## Quick Start
+ * ```ts
+ * import { SchemaIntelligenceModule } from '@cubejs-backend/schema-intelligence';
+ *
+ * // In cube.js config:
+ * module.exports = {
+ *   schemaIntelligence: {
+ *     scoring: true,
+ *     embedding: { provider: 'ollama', endpoint: 'http://ollama:11434' },
+ *     translator: { enabled: true },
+ *     llm: { provider: 'ollama', model: 'qwen3:0.6b', endpoint: 'http://ollama:11434' },
+ *   },
+ * };
+ * ```
+ *
+ * ## Custom Implementations
+ * All core components implement swappable interfaces:
+ * ```ts
+ * import type { VectorStore, EmbeddingProvider, LLMProvider } from '@cubejs-backend/schema-intelligence';
+ * ```
  */
 
 export { SchemaIntelligenceModule } from './SchemaIntelligenceModule';
 
-// Types
+// ── Configuration Types ──
 export type {
   SchemaIntelligenceOptions,
+  EmbeddingConfig,
+  LLMConfig,
+  TranslatorConfig,
+  ScoringConfig,
+  ScoringCriterionConfig,
+  FeedbackConfig,
+  VectorStoreConfig,
+  DistanceMetricType,
+} from './types';
+
+// ── Result Types ──
+export type {
   CubeMetaConfig,
   CubeQuery,
   ScoreResult,
@@ -16,19 +49,14 @@ export type {
   TranslationContext,
   FeedbackEntry,
   FeedbackStats,
-  FeedbackConfig,
   ValidationResult,
   VectorSearchResult,
-  VectorStoreConfig,
-  EmbeddingConfig,
-  LLMConfig,
-  TranslatorConfig,
-  ScoringConfig,
-  ScoringCriterionConfig,
   EnrichmentSuggestion,
-  DistanceMetricType,
   IntelligenceMetrics,
-  // Interfaces for custom implementations
+} from './types';
+
+// ── Interfaces for Custom Implementations ──
+export type {
   VectorStore,
   EmbeddingProvider,
   ScoringStrategy,
@@ -37,7 +65,7 @@ export type {
   FeedbackStore,
 } from './types';
 
-// Individual components (for advanced users building custom pipelines)
+// ── Built-in Components (for advanced users building custom pipelines) ──
 export { RuleBasedScorer } from './scoring/RuleBasedScorer';
 export { InMemoryVectorStore } from './vectorstore/InMemoryVectorStore';
 export { PgVectorStore } from './vectorstore/PgVectorStore';

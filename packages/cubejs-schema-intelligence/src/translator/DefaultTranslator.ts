@@ -43,6 +43,31 @@ export interface DefaultTranslatorDeps {
   compiledMeta: CubeMetaConfig[];
 }
 
+/**
+ * Default NLQ → Cube Query translator with self-healing retry loop.
+ *
+ * Pipeline:
+ * 1. Embed the natural language question
+ * 2. Vector search for the most relevant cube schemas
+ * 3. Serialize schemas into compact text for the LLM context
+ * 4. Retrieve few-shot examples from the feedback store
+ * 5. Build prompt and call the LLM for structured JSON output
+ * 6. Validate the generated query against compiled metadata
+ * 7. If validation fails, retry with error context (self-healing)
+ *
+ * @example
+ * ```ts
+ * const translator = new DefaultTranslator({
+ *   llmProvider, embeddingProvider, vectorStore,
+ *   feedbackStore: null, serializer, compiledMeta: cubes,
+ * });
+ * const result = await translator.translate('show revenue by month');
+ * if (result.query) {
+ *   console.log(result.query);       // { measures: ['Orders.revenue'], timeDimensions: [...] }
+ *   console.log(result.confidence);   // 0.87
+ * }
+ * ```
+ */
 export class DefaultTranslator {
   private deps: DefaultTranslatorDeps;
   private promptBuilder: PromptBuilder;
@@ -54,11 +79,18 @@ export class DefaultTranslator {
     this.validator = new QueryValidator(deps.compiledMeta);
   }
 
+  /** Update the compiled cube metadata (called when schemas are recompiled). */
   updateMeta(cubes: CubeMetaConfig[]): void {
     this.deps.compiledMeta = cubes;
     this.validator = new QueryValidator(cubes);
   }
 
+  /**
+   * Translate a natural language question into a Cube.js query.
+   * @param nlq - The question in natural language (e.g. "show revenue by month").
+   * @param context - Optional context: conversation history, max retries, security context.
+   * @returns Translation result with `query` (or null on failure), `confidence`, `schemasUsed`, and `translationId`.
+   */
   async translate(nlq: string, context?: TranslationContext): Promise<TranslationResult> {
     const startTime = Date.now();
     const maxRetries = context?.maxRetries ?? 3;
