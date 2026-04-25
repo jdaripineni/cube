@@ -78,14 +78,23 @@ export class SqliteFeedbackStore implements FeedbackStore {
         execution_error TEXT,
         user_id TEXT,
         latency_ms INTEGER,
-        retry_count INTEGER DEFAULT 0
+        retry_count INTEGER DEFAULT 0,
+        nlq_embedding TEXT
       )
     `);
 
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_feedback_rating ON feedback(rating);
       CREATE INDEX IF NOT EXISTS idx_feedback_timestamp ON feedback(timestamp);
+      CREATE INDEX IF NOT EXISTS idx_feedback_schemas ON feedback(schemas_used);
     `);
+
+    // Migration: add nlq_embedding column if missing (existing installs)
+    try {
+      this.db.exec('ALTER TABLE feedback ADD COLUMN nlq_embedding TEXT');
+    } catch {
+      // Column already exists — expected
+    }
   }
 
   /** Save a translation attempt (generated query, schemas used, latency, etc.). */
@@ -93,8 +102,8 @@ export class SqliteFeedbackStore implements FeedbackStore {
     const stmt = this.db.prepare(`
       INSERT OR REPLACE INTO feedback
         (translation_id, timestamp, nlq, generated_query, schemas_used, rating,
-         corrected_query, execution_success, execution_error, user_id, latency_ms, retry_count)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         corrected_query, execution_success, execution_error, user_id, latency_ms, retry_count, nlq_embedding)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
@@ -110,6 +119,7 @@ export class SqliteFeedbackStore implements FeedbackStore {
       entry.userId || null,
       entry.latencyMs,
       entry.retryCount,
+      (entry as any).nlqEmbedding ? JSON.stringify((entry as any).nlqEmbedding) : null,
     );
   }
 
@@ -121,20 +131,77 @@ export class SqliteFeedbackStore implements FeedbackStore {
     stmt.run(rating, correctedQuery ? JSON.stringify(correctedQuery) : null, translationId);
   }
 
-  /** Retrieve recent positively-rated translations for use as few-shot examples. */
+  /** Retrieve positively-rated translations for use as few-shot examples.
+   *  When `similarTo` embedding is provided, results are ranked by cosine similarity. */
   async getPositiveExamples(opts: ExampleQueryOptions): Promise<FeedbackEntry[]> {
     const limit = opts.topK || 5;
     const minRating = opts.minRating || 'positive';
 
     const ratings = minRating === 'corrected' ? "'corrected'" : "'positive', 'corrected'";
+
+    // Fetch candidates (more than needed for similarity ranking)
+    const fetchLimit = opts.similarTo ? limit * 5 : limit;
     const rows = this.db.prepare(`
       SELECT * FROM feedback
       WHERE rating IN (${ratings}) AND generated_query IS NOT NULL
       ORDER BY timestamp DESC
       LIMIT ?
-    `).all(limit);
+    `).all(fetchLimit);
 
-    return rows.map((r: any) => this.rowToEntry(r));
+    let entries = rows.map((r: any) => this.rowToEntry(r));
+
+    // Rank by cosine similarity if embedding is provided
+    if (opts.similarTo && opts.similarTo.length > 0) {
+      const queryEmb = opts.similarTo;
+      const scored = entries
+        .map((entry: FeedbackEntry) => {
+          const row = rows.find((r: any) => r.translation_id === entry.translationId);
+          const storedEmb = row?.nlq_embedding ? JSON.parse(row.nlq_embedding) : null;
+          const sim = storedEmb ? this.cosineSimilarity(queryEmb, storedEmb) : 0;
+          return { entry, sim };
+        })
+        .sort((a: { sim: number }, b: { sim: number }) => b.sim - a.sim);
+
+      entries = scored.map((s: { entry: FeedbackEntry }) => s.entry);
+    }
+
+    // Diversity: prefer examples from different cubes
+    if (opts.diverseCubes !== false && entries.length > limit) {
+      const diverse: FeedbackEntry[] = [];
+      const seenCubes = new Set<string>();
+      for (const e of entries) {
+        const key = e.schemasUsed.sort().join(',');
+        if (!seenCubes.has(key)) {
+          diverse.push(e);
+          seenCubes.add(key);
+          if (diverse.length >= limit) break;
+        }
+      }
+      // Fill remaining with any entries
+      if (diverse.length < limit) {
+        for (const e of entries) {
+          if (!diverse.includes(e)) {
+            diverse.push(e);
+            if (diverse.length >= limit) break;
+          }
+        }
+      }
+      return diverse;
+    }
+
+    return entries.slice(0, limit);
+  }
+
+  private cosineSimilarity(a: number[], b: number[]): number {
+    if (a.length !== b.length) return 0;
+    let dot = 0, normA = 0, normB = 0;
+    for (let i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+    const denom = Math.sqrt(normA) * Math.sqrt(normB);
+    return denom === 0 ? 0 : dot / denom;
   }
 
   /** Get recurring error patterns from negative feedback (for LLM "mistakes to avoid" prompts). */
@@ -184,13 +251,36 @@ export class SqliteFeedbackStore implements FeedbackStore {
       'SELECT COUNT(*) as cnt FROM feedback WHERE retry_count > 0'
     ).get().cnt;
 
+    // Top failing cubes: cubes that appear most often in negative/failed translations
+    const failingRows = this.db.prepare(`
+      SELECT schemas_used, COUNT(*) as fail_count
+      FROM feedback
+      WHERE rating = 'negative' OR (generated_query IS NULL AND rating != 'pending')
+      GROUP BY schemas_used
+      ORDER BY fail_count DESC
+      LIMIT 10
+    `).all();
+
+    const topFailingCubes = failingRows.flatMap((r: any) => {
+      const cubes: string[] = r.schemas_used ? JSON.parse(r.schemas_used) : [];
+      return cubes.map(cube => ({ cube, failureRate: r.fail_count / total }));
+    }).reduce((acc: Array<{ cube: string; failureRate: number }>, item: { cube: string; failureRate: number }) => {
+      const existing = acc.find(a => a.cube === item.cube);
+      if (existing) {
+        existing.failureRate += item.failureRate;
+      } else {
+        acc.push(item);
+      }
+      return acc;
+    }, []).sort((a: any, b: any) => b.failureRate - a.failureRate).slice(0, 10);
+
     return {
       totalTranslations: total,
       positiveRate: positive / total,
       negativeRate: negative / total,
       correctedRate: corrected / total,
       selfHealSuccessRate: retriedTotal > 0 ? retriedSuccess / retriedTotal : 0,
-      topFailingCubes: [],
+      topFailingCubes,
       averageLatencyMs: Math.round(avgLatency),
       averageRetries: Math.round(avgRetries * 100) / 100,
     };

@@ -149,6 +149,65 @@ embedding: {
 | `memory` | <500 schemas, dev/test | Nothing |
 | `pgvector` | Production, persistence | PostgreSQL with pgvector extension |
 
+### Persistence across restarts
+
+By default, **all AI data is ephemeral** — feedback, vector embeddings, and caches
+are stored in-memory and lost when the CubeJS process restarts.
+
+| Data | Default | Persistent option |
+|------|---------|-------------------|
+| Feedback (ratings, corrections, few-shot examples) | SQLite `:memory:` | Set `feedback.connectionOptions.path` to a file path |
+| Vector store (schema embeddings) | JS `Map` (in-memory) | Switch to `pgvector` with a connection string |
+| Embedding cache | In-process `Map` | Rebuilt automatically (no config needed) |
+
+**Feedback** is the most critical to persist — it contains user ratings and corrections
+that are unrecoverable if lost. Vector embeddings are self-healing (re-indexed on schema
+compilation) but re-indexing costs embedding API calls on every restart.
+
+#### Persistent feedback (SQLite on disk)
+
+```js
+module.exports = {
+  schemaIntelligence: {
+    feedback: {
+      enabled: true,
+      connectionOptions: {
+        path: '/data/ai/feedback.db',  // file path — directory must exist
+      },
+    },
+  },
+};
+```
+
+Or via environment variable:
+```bash
+CUBEJS_AI_FEEDBACK_PATH=/data/ai/feedback.db
+```
+
+> **Kubernetes:** Mount a PersistentVolumeClaim at `/data/ai`. The atlas.cubejs.service
+> Helm chart supports this via `ai.persistence.enabled=true` (see Helm values below).
+
+#### Persistent vector store (pgvector)
+
+```js
+module.exports = {
+  schemaIntelligence: {
+    vectorStore: {
+      provider: 'pgvector',
+      connectionString: 'postgresql://user:pass@host:5432/db',
+    },
+  },
+};
+```
+
+Or via environment variables:
+```bash
+CUBEJS_AI_VECTOR_STORE=pgvector
+CUBEJS_AI_VECTOR_STORE_CONNECTION_STRING=postgresql://user:pass@host:5432/db
+```
+
+> The PostgreSQL instance must have the `pgvector` extension installed (`CREATE EXTENSION vector`).
+
 ## LLM Providers
 
 | Provider | Models | Requires |
@@ -170,6 +229,114 @@ Default weights (customizable):
 | `datasource_explicit` | 0.10 | Data source is explicitly declared |
 | `join_descriptions` | 0.10 | Joins have descriptions |
 
+## Schema Hints via `meta.ai`
+
+Cube schema authors can embed LLM context directly in their cube definitions using the
+standard `meta` field — no schema format or CRD changes required. The convention is
+`meta.ai.*` at any level (cube, measure, dimension, segment).
+
+### Supported `meta.ai` keys
+
+| Key | Level | Type | Purpose |
+|-----|-------|------|---------|
+| `synonyms` | cube, measure, dimension | `string[]` | Alternative names the LLM should recognize |
+| `hints` | cube, measure, dimension | `string` | Free-text guidance for the LLM |
+| `enumValues` | dimension, measure | `string[]` | Valid values (shown to LLM for filter generation) |
+| `examples` | cube | `Array<{nlq, query}>` | Few-shot examples authored by schema owners |
+
+### Example
+
+```js
+cube(`Orders`, {
+  description: 'E-commerce order transactions',
+  meta: {
+    ai: {
+      synonyms: ['purchases', 'sales', 'transactions'],
+      hints: 'Use for revenue and order volume queries. Combine with Products cube for category breakdowns.',
+      examples: [
+        {
+          nlq: 'Total revenue last month',
+          query: {
+            measures: ['Orders.totalAmount'],
+            timeDimensions: [{ dimension: 'Orders.createdAt', dateRange: 'last month' }],
+          },
+        },
+        {
+          nlq: 'Top 5 cities by order count this year',
+          query: {
+            measures: ['Orders.count'],
+            dimensions: ['Orders.city'],
+            timeDimensions: [{ dimension: 'Orders.createdAt', dateRange: 'this year' }],
+            order: { 'Orders.count': 'desc' },
+            limit: 5,
+          },
+        },
+      ],
+    },
+  },
+
+  measures: {
+    count: {
+      type: 'count',
+      description: 'Total number of orders',
+    },
+    totalAmount: {
+      type: 'sum',
+      sql: `amount`,
+      description: 'Sum of order amounts in USD',
+      meta: {
+        ai: { synonyms: ['revenue', 'sales', 'income'] },
+      },
+    },
+  },
+
+  dimensions: {
+    status: {
+      type: 'string',
+      sql: `status`,
+      description: 'Current order status',
+      meta: {
+        ai: {
+          enumValues: ['pending', 'processing', 'shipped', 'delivered', 'cancelled'],
+          synonyms: ['state', 'order state'],
+        },
+      },
+    },
+    city: {
+      type: 'string',
+      sql: `city`,
+      description: 'Customer city',
+    },
+    createdAt: {
+      type: 'time',
+      sql: `created_at`,
+      description: 'Order creation timestamp',
+    },
+  },
+});
+```
+
+### How it flows through the pipeline
+
+1. **CompactSerializer** extracts `synonyms`, `hints`, and `enumValues` into the
+   serialized schema text that the LLM sees in its context window:
+   ```
+   Orders: E-commerce order transactions [aka: purchases/sales/transactions; Use for revenue...] —
+     measures[count(count, Total number of orders); totalAmount(sum, Sum of order amounts) [aka: revenue/sales/income]],
+     dimensions[status(string, Current order status) [values: pending,processing,shipped,delivered,cancelled; aka: state/order state]]
+   ```
+2. **DefaultTranslator** collects `meta.ai.examples` from the vector-search results
+   and passes them to the PromptBuilder.
+3. **PromptBuilder** includes schema-authored examples in a dedicated
+   "EXAMPLES FROM SCHEMA AUTHORS" section, separate from feedback-derived examples.
+
+### Why `meta.ai` instead of a new schema field?
+
+- `meta` is already validated by the Cube compiler at every level — no changes needed
+- Works with existing Cube CRDs — application teams just update their JS files
+- Fully opt-in — cubes without `meta.ai` work exactly as before
+- The `meta` field passes through the compiler unchanged, so it's forward-compatible
+
 ## Environment Variables
 
 All settings can also be driven via environment variables:
@@ -178,6 +345,9 @@ All settings can also be driven via environment variables:
 CUBEJS_SCHEMA_INTELLIGENCE=true
 CUBEJS_AI_EMBEDDING_PROVIDER=local       # local (default) | openai | ollama
 CUBEJS_AI_VECTOR_STORE=memory            # memory (default) | pgvector
+CUBEJS_AI_VECTOR_STORE_CONNECTION_STRING= # required when CUBEJS_AI_VECTOR_STORE=pgvector
+CUBEJS_AI_FEEDBACK_ENABLED=true          # default: true when intelligence enabled
+CUBEJS_AI_FEEDBACK_PATH=                 # file path for persistent feedback (default: in-memory)
 # Optional: enable NLQ translation
 CUBEJS_AI_LLM_PROVIDER=openai
 CUBEJS_AI_LLM_API_KEY=<your-key>

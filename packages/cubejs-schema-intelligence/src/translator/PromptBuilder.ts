@@ -37,6 +37,8 @@ export interface PromptBuildOptions {
   negativePatterns?: NegativePattern[];
   previousErrors?: Array<{ message: string; suggestions?: string[] }>;
   customSystemPrompt?: string;
+  /** Schema-embedded examples from cube meta.ai.examples. */
+  schemaExamples?: Array<{ nlq: string; query: any }>;
 }
 
 /**
@@ -68,12 +70,22 @@ export class PromptBuilder {
 
     const userParts: string[] = [];
 
-    // Few-shot examples
+    // Few-shot examples from feedback history
     if (opts.fewShotExamples && opts.fewShotExamples.length > 0) {
       userParts.push('EXAMPLES OF SUCCESSFUL TRANSLATIONS:');
       for (const ex of opts.fewShotExamples.slice(0, 5)) {
         userParts.push(`Q: ${ex.nlq}`);
         userParts.push(`A: ${JSON.stringify(ex.correctedQuery || ex.generatedQuery)}`);
+        userParts.push('');
+      }
+    }
+
+    // Schema-provided examples from cube meta.ai.examples
+    if (opts.schemaExamples && opts.schemaExamples.length > 0) {
+      userParts.push('EXAMPLES FROM SCHEMA AUTHORS:');
+      for (const ex of opts.schemaExamples.slice(0, 5)) {
+        userParts.push(`Q: ${ex.nlq}`);
+        userParts.push(`A: ${JSON.stringify(ex.query)}`);
         userParts.push('');
       }
     }

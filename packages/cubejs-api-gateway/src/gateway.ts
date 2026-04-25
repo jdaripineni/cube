@@ -543,12 +543,33 @@ class ApiGateway {
         res.status(404).json({ error: 'Schema intelligence is not enabled' });
         return;
       }
-      const { question, conversationHistory } = req.body;
+      const { question, conversationHistory, dryRun } = req.body;
       if (!question || typeof question !== 'string') {
         res.status(400).json({ error: 'Missing required field: question (string)' });
         return;
       }
-      const result = await intelligence.translate(question, conversationHistory);
+      const context = {
+        securityContext: req.context?.securityContext,
+        conversationHistory,
+      };
+      const result = await intelligence.translate(question, context);
+
+      // Auto-verify: compile the generated query to SQL to validate it's executable.
+      // This provides implicit positive/negative feedback for continuous learning.
+      if (result.query && !dryRun) {
+        try {
+          await compilerApi.getSql(result.query);
+          result.executionVerified = true;
+          // Auto-promote to positive if SQL generation succeeds and no user feedback yet
+          if (result.translationId) {
+            intelligence.submitFeedback(result.translationId, 'positive').catch(() => {});
+          }
+        } catch (execErr: any) {
+          result.executionVerified = false;
+          result.executionError = execErr.message;
+        }
+      }
+
       res.json(result);
     }));
 
@@ -572,12 +593,13 @@ class ApiGateway {
         res.status(404).json({ error: 'Schema intelligence is not enabled' });
         return;
       }
-      const { translationId, rating, correction } = req.body;
-      if (!translationId || typeof rating !== 'number') {
-        res.status(400).json({ error: 'Missing required fields: translationId (string), rating (number 1-5)' });
+      const { translationId, rating, correctedQuery } = req.body;
+      const validRatings = ['positive', 'negative', 'corrected'];
+      if (!translationId || typeof translationId !== 'string' || !validRatings.includes(rating)) {
+        res.status(400).json({ error: 'Missing required fields: translationId (string), rating ("positive" | "negative" | "corrected")' });
         return;
       }
-      await intelligence.submitFeedback(translationId, rating, correction);
+      await intelligence.submitFeedback(translationId, rating, correctedQuery);
       res.json({ ok: true });
     }));
 

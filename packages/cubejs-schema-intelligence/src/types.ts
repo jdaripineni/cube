@@ -495,6 +495,10 @@ export interface TranslationResult {
   validationErrors?: string[];
   /** How many retry iterations the self-heal loop performed. */
   retryCount: number;
+  /** Whether the generated query was verified against the data model (SQL compilation). Set by the gateway. */
+  executionVerified?: boolean;
+  /** Error message if execution verification failed. */
+  executionError?: string;
 }
 
 // ── Feedback ──
@@ -696,6 +700,14 @@ export interface CubeMetaConfig {
   title?: string;
   /** Description — the single most impactful field for LLM readiness scoring. */
   description?: string;
+  /**
+   * Arbitrary metadata from the cube schema.
+   * Convention: `meta.ai` contains LLM hints:
+   * - `meta.ai.synonyms: string[]` — alternative names for this cube
+   * - `meta.ai.hints: string` — free-text guidance for the LLM
+   * - `meta.ai.examples: Array<{ nlq: string; query: CubeQuery }>` — few-shot examples
+   */
+  meta?: Record<string, any>;
   /** All measures defined in this cube. */
   measures?: CubeMeasureMeta[];
   /** All dimensions defined in this cube. */
@@ -794,6 +806,8 @@ export interface SchemaIntelligenceOptions {
   scoring?: ScoringConfig;
   /** NLQ translator config. Requires `llm` to be set. See {@link TranslatorConfig}. */
   translator?: TranslatorConfig;
+  /** LLM provider for NLQ translation. Required when `translator.enabled` is `true`. See {@link LLMConfig}. */
+  llm?: string | LLMConfig;
   /** Feedback store config. See {@link FeedbackConfig}. */
   feedback?: FeedbackConfig;
   /** Search behavior config (defaults, diversity, custom strategy). See {@link SearchConfig}. */

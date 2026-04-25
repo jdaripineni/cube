@@ -141,6 +141,19 @@ export class DefaultTranslator {
       }
     }
 
+    // Step 4b: Extract schema-authored examples from cube meta.ai.examples
+    const schemaExamples: Array<{ nlq: string; query: any }> = [];
+    for (const cube of relevantCubes) {
+      const examples = cube.meta?.ai?.examples;
+      if (Array.isArray(examples)) {
+        for (const ex of examples) {
+          if (ex.nlq && ex.query) {
+            schemaExamples.push({ nlq: ex.nlq, query: ex.query });
+          }
+        }
+      }
+    }
+
     // Step 5: Self-healing retry loop
     let lastErrors: Array<{ message: string; suggestions?: string[] }> = [];
     let retryCount = 0;
@@ -152,6 +165,7 @@ export class DefaultTranslator {
         conversationHistory: context?.conversationHistory,
         fewShotExamples,
         negativePatterns,
+        schemaExamples: schemaExamples.length > 0 ? schemaExamples : undefined,
         previousErrors: lastErrors.length > 0 ? lastErrors : undefined,
       });
 
@@ -178,7 +192,7 @@ export class DefaultTranslator {
         const latencyMs = Date.now() - startTime;
         const confidence = this.computeConfidence(results, retryCount);
 
-        // Save to feedback store
+        // Save to feedback store (with embedding for similarity retrieval)
         if (this.deps.feedbackStore) {
           try {
             await this.deps.feedbackStore.save({
@@ -190,7 +204,8 @@ export class DefaultTranslator {
               rating: 'pending',
               latencyMs,
               retryCount,
-            });
+              nlqEmbedding: nlqEmbedding,
+            } as any);
           } catch {
             // Non-critical
           }
@@ -226,7 +241,8 @@ export class DefaultTranslator {
           rating: 'pending',
           latencyMs,
           retryCount: maxRetries,
-        });
+          nlqEmbedding: nlqEmbedding,
+        } as any);
       } catch {
         // Non-critical
       }

@@ -106,7 +106,11 @@ export class SchemaIntelligenceModule {
     // LLM + Translator (optional)
     if (this.options.translator?.enabled !== false) {
       const { resolveLLMProvider } = await import('./llm/LLMProviders');
-      this.llmProvider = await resolveLLMProvider(this.options.translator);
+      // Resolve from top-level llm config first, fall back to translator.llm
+      const llmSource = this.options.llm
+        ? { ...this.options.translator, llm: this.options.llm }
+        : this.options.translator;
+      this.llmProvider = await resolveLLMProvider(llmSource);
     }
 
     this.initialized = true;

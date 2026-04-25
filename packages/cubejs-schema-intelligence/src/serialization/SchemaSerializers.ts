@@ -50,7 +50,13 @@ export class CompactSerializer implements SchemaSerializer {
           .filter(m => m.isVisible !== false && m.public !== false)
           .map(m => {
             const desc = m.description ? `, ${m.description}` : '';
-            return `${m.name}(${m.type}${desc})`;
+            const ai = m.meta?.ai;
+            const extras: string[] = [];
+            if (ai?.synonyms?.length) extras.push(`aka: ${ai.synonyms.join('/')}`);
+            if (ai?.enumValues?.length) extras.push(`values: ${ai.enumValues.join(',')}`);
+            if (ai?.hints) extras.push(ai.hints);
+            const extraStr = extras.length ? ` [${extras.join('; ')}]` : '';
+            return `${m.name}(${m.type}${desc})${extraStr}`;
           });
         parts.push(`measures[${mList.join('; ')}]`);
       }
@@ -63,7 +69,13 @@ export class CompactSerializer implements SchemaSerializer {
           .map(d => {
             const pk = d.primaryKey ? ',PK' : '';
             const desc = d.description ? `, ${d.description}` : '';
-            return `${d.name}(${d.type}${pk}${desc})`;
+            const ai = d.meta?.ai;
+            const extras: string[] = [];
+            if (ai?.synonyms?.length) extras.push(`aka: ${ai.synonyms.join('/')}`);
+            if (ai?.enumValues?.length) extras.push(`values: ${ai.enumValues.join(',')}`);
+            if (ai?.hints) extras.push(ai.hints);
+            const extraStr = extras.length ? ` [${extras.join('; ')}]` : '';
+            return `${d.name}(${d.type}${pk}${desc})${extraStr}`;
           });
         parts.push(`dimensions[${dList.join('; ')}]`);
       }
@@ -75,7 +87,12 @@ export class CompactSerializer implements SchemaSerializer {
       }
 
       const desc = cube.description ? `: ${cube.description}` : '';
-      lines.push(`${cube.name}${desc} — ${parts.join(', ')}`);
+      const cubeAi = cube.meta?.ai;
+      const cubeMeta: string[] = [];
+      if (cubeAi?.synonyms?.length) cubeMeta.push(`aka: ${cubeAi.synonyms.join('/')}`);
+      if (cubeAi?.hints) cubeMeta.push(cubeAi.hints);
+      const cubeMetaStr = cubeMeta.length ? ` [${cubeMeta.join('; ')}]` : '';
+      lines.push(`${cube.name}${desc}${cubeMetaStr} — ${parts.join(', ')}`);
     }
 
     let result = lines.join('\n\n');
