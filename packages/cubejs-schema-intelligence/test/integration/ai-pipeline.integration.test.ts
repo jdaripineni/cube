@@ -28,6 +28,8 @@ import type {
   ExampleQueryOptions,
   NegativePattern,
   FeedbackStats,
+  FeedbackQueryOptions,
+  FeedbackQueryResult,
   CubeQuery,
   CompletionOptions,
 } from '../../src/types';
@@ -224,6 +226,17 @@ class StubFeedbackStore implements FeedbackStore {
       averageLatencyMs: 0,
       averageRetries: 0,
     };
+  }
+
+  async queryFeedback(opts: FeedbackQueryOptions): Promise<FeedbackQueryResult> {
+    let filtered = [...this.entries];
+    if (opts.rating) filtered = filtered.filter(e => e.rating === opts.rating);
+    if (opts.conversationId) filtered = filtered.filter(e => e.conversationId === opts.conversationId);
+    if (opts.since) filtered = filtered.filter(e => e.timestamp >= opts.since!);
+    if (opts.until) filtered = filtered.filter(e => e.timestamp <= opts.until!);
+    const limit = opts.limit ?? 50;
+    const offset = opts.offset ?? 0;
+    return { entries: filtered.slice(offset, offset + limit), total: filtered.length, limit, offset };
   }
 
   async shutdown(): Promise<void> {}

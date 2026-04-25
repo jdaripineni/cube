@@ -634,6 +634,60 @@ class ApiGateway {
       res.json({ ok: true });
     }));
 
+    app.get(`${this.basePath}/v1/ai/feedback`, userMiddlewares, userAsyncHandler(async (req: any, res) => {
+      await this.assertApiScope('ai', req.context?.securityContext);
+      const compilerApi = await this.getCompilerApi(req.context);
+      const intelligence = compilerApi.getSchemaIntelligence?.();
+      if (!intelligence) {
+        res.status(404).json({ error: 'Schema intelligence is not enabled' });
+        return;
+      }
+      const opts: any = {};
+      if (req.query.rating) opts.rating = req.query.rating;
+      if (req.query.conversationId) opts.conversationId = req.query.conversationId;
+      if (req.query.since) opts.since = new Date(req.query.since);
+      if (req.query.until) opts.until = new Date(req.query.until);
+      if (req.query.limit) opts.limit = parseInt(req.query.limit, 10);
+      if (req.query.offset) opts.offset = parseInt(req.query.offset, 10);
+
+      const result = await intelligence.getFeedbackEntries(opts);
+      if (!result) {
+        res.json({ entries: [], total: 0, limit: 50, offset: 0 });
+        return;
+      }
+      res.json(result);
+    }));
+
+    app.get(`${this.basePath}/v1/ai/conversations/:id`, userMiddlewares, userAsyncHandler(async (req: any, res) => {
+      await this.assertApiScope('ai', req.context?.securityContext);
+      const compilerApi = await this.getCompilerApi(req.context);
+      const intelligence = compilerApi.getSchemaIntelligence?.();
+      if (!intelligence) {
+        res.status(404).json({ error: 'Schema intelligence is not enabled' });
+        return;
+      }
+      const convManager = await intelligence.getConversationManager();
+      const session = await convManager.get(req.params.id);
+      if (!session) {
+        res.status(404).json({ error: 'Conversation not found or expired' });
+        return;
+      }
+      res.json(session);
+    }));
+
+    app.delete(`${this.basePath}/v1/ai/conversations/:id`, userMiddlewares, userAsyncHandler(async (req: any, res) => {
+      await this.assertApiScope('ai', req.context?.securityContext);
+      const compilerApi = await this.getCompilerApi(req.context);
+      const intelligence = compilerApi.getSchemaIntelligence?.();
+      if (!intelligence) {
+        res.status(404).json({ error: 'Schema intelligence is not enabled' });
+        return;
+      }
+      const convManager = await intelligence.getConversationManager();
+      await convManager.delete(req.params.id);
+      res.json({ ok: true });
+    }));
+
     app.get(`${this.basePath}/v1/ai/status`, userMiddlewares, userAsyncHandler(async (req: any, res) => {
       await this.assertApiScope('ai', req.context?.securityContext);
       const compilerApi = await this.getCompilerApi(req.context);

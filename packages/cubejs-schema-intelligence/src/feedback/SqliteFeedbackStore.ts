@@ -8,6 +8,8 @@ import type {
   FeedbackStore,
   FeedbackEntry,
   FeedbackStats,
+  FeedbackQueryOptions,
+  FeedbackQueryResult,
   ExampleQueryOptions,
   NegativePattern,
   CubeQuery,
@@ -230,6 +232,45 @@ export class SqliteFeedbackStore implements FeedbackStore {
       count: r.count,
       lastSeen: new Date(r.last_seen),
     }));
+  }
+
+  /** Query feedback entries with filtering and pagination. */
+  async queryFeedback(opts: FeedbackQueryOptions): Promise<FeedbackQueryResult> {
+    const limit = Math.min(opts.limit ?? 50, 200);
+    const offset = opts.offset ?? 0;
+    const conditions: string[] = [];
+    const params: any[] = [];
+
+    if (opts.rating) {
+      conditions.push('rating = ?');
+      params.push(opts.rating);
+    }
+    if (opts.conversationId) {
+      conditions.push('conversation_id = ?');
+      params.push(opts.conversationId);
+    }
+    if (opts.since) {
+      conditions.push('timestamp >= ?');
+      params.push(opts.since.toISOString());
+    }
+    if (opts.until) {
+      conditions.push('timestamp <= ?');
+      params.push(opts.until.toISOString());
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const total = this.db.prepare(`SELECT COUNT(*) as cnt FROM feedback ${where}`).get(...params).cnt;
+    const rows = this.db.prepare(
+      `SELECT * FROM feedback ${where} ORDER BY timestamp DESC LIMIT ? OFFSET ?`
+    ).all(...params, limit, offset);
+
+    return {
+      entries: rows.map((r: any) => this.rowToEntry(r)),
+      total,
+      limit,
+      offset,
+    };
   }
 
   /** Compute aggregate statistics: success/failure rates, average latency, retry stats. */

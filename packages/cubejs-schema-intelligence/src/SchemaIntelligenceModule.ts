@@ -19,6 +19,8 @@ import type {
   TranslationContext,
   VectorSearchResult,
   FeedbackStats,
+  FeedbackQueryOptions,
+  FeedbackQueryResult,
   CubeQuery,
   SearchStrategy,
   SearchConfig,
@@ -367,6 +369,11 @@ export class SchemaIntelligenceModule {
   async getFeedbackStats(): Promise<FeedbackStats | null> {
     if (!this.enabled || !this.feedbackStore) return null;
     return this.feedbackStore.getStats();
+  }
+
+  async getFeedbackEntries(opts: FeedbackQueryOptions): Promise<FeedbackQueryResult | null> {
+    if (!this.enabled || !this.feedbackStore) return null;
+    return this.feedbackStore.queryFeedback(opts);
   }
 
   async getStatus(): Promise<Record<string, any>> {

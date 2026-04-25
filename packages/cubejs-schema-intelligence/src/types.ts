@@ -666,10 +666,36 @@ export interface FeedbackStore {
   getPositiveExamples(opts: ExampleQueryOptions): Promise<FeedbackEntry[]>;
   /** Retrieve recurring failure patterns to inform negative-example prompts. */
   getNegativePatterns(): Promise<NegativePattern[]>;
+  /** Query feedback entries with optional filters and pagination. */
+  queryFeedback(opts: FeedbackQueryOptions): Promise<FeedbackQueryResult>;
   /** Aggregate statistics for the `/ai/status` endpoint. */
   getStats(): Promise<FeedbackStats>;
   /** Release resources. */
   shutdown(): Promise<void>;
+}
+
+/** Options for querying feedback entries from the store. */
+export interface FeedbackQueryOptions {
+  /** Filter by rating. */
+  rating?: 'positive' | 'negative' | 'corrected' | 'pending';
+  /** Filter by conversation ID. */
+  conversationId?: string;
+  /** Only entries after this date. */
+  since?: Date;
+  /** Only entries before this date. */
+  until?: Date;
+  /** Max entries to return. Default: 50. */
+  limit?: number;
+  /** Offset for pagination. Default: 0. */
+  offset?: number;
+}
+
+/** Paginated result from queryFeedback. */
+export interface FeedbackQueryResult {
+  entries: FeedbackEntry[];
+  total: number;
+  limit: number;
+  offset: number;
 }
 
 /** Options for retrieving few-shot example queries from the feedback store. */

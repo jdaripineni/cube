@@ -54,6 +54,8 @@ export type {
   ConversationMessage,
   FeedbackEntry,
   FeedbackStats,
+  FeedbackQueryOptions,
+  FeedbackQueryResult,
   ValidationResult,
   VectorSearchResult,
   EnrichmentSuggestion,
