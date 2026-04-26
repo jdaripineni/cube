@@ -190,12 +190,14 @@ const schemaOptions = Joi.object().keys({
         fewShotCount: Joi.number().integer().min(0),
       }),
       // LLM provider for NLQ translation: 'openai' or 'ollama'
-      // baseUrl = OpenAI-compatible endpoint (e.g. http://ollama:11434/v1)
+      // endpoint = provider URL (e.g. http://ollama:11434 or https://api.openai.com/v1)
+      // baseUrl  = alias for endpoint (kept for backward compatibility)
       llm: Joi.object().keys({
         provider: Joi.string().valid('openai', 'ollama'),
         apiKey: Joi.string(),
         model: Joi.string(),
         baseUrl: Joi.string(),
+        endpoint: Joi.string(),
         temperature: Joi.number().min(0).max(2),
       }),
       // Feedback store for continuous improvement via user ratings
