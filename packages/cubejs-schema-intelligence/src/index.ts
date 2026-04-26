@@ -88,6 +88,8 @@ export { DefaultTranslator } from './translator/DefaultTranslator';
 export { PromptBuilder } from './translator/PromptBuilder';
 export { SqliteFeedbackStore } from './feedback/SqliteFeedbackStore';
 export { OpenAILLMProvider, OllamaLLMProvider, resolveLLMProvider, MODEL_REGISTRY } from './llm/LLMProviders';
+export { retryFetch } from './llm/retryFetch';
+export type { RetryOptions } from './llm/retryFetch';
 export { AgentsConfigLoader } from './config/AgentsConfigLoader';
 export { MetricsCollector } from './metrics/MetricsCollector';
 export { ConversationManager } from './conversation/ConversationManager';

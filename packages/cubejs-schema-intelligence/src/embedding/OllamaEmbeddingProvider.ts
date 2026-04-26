@@ -5,6 +5,7 @@
  */
 
 import type { EmbeddingProvider, EmbeddingConfig } from '../types';
+import { retryFetch } from '../llm/retryFetch';
 
 /**
  * Embedding provider for self-hosted Ollama instances.
@@ -43,7 +44,7 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
     const results: number[][] = [];
 
     for (const text of texts) {
-      const resp = await fetch(`${this.endpoint}/api/embed`, {
+      const resp = await retryFetch(`${this.endpoint}/api/embed`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: this.model, input: text }),

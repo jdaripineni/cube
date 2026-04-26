@@ -5,6 +5,7 @@
  */
 
 import type { LLMProvider, LLMConfig, CompletionOptions, TranslatorConfig } from '../types';
+import { retryFetch } from './retryFetch';
 
 // ── Predefined model name → provider config mapping ──
 // Aligned with Cube Cloud's agents/config.yml `llm` values.
@@ -144,7 +145,7 @@ export class OllamaLLMProvider implements LLMProvider {
     }
     messages.push({ role: 'user', content: prompt });
 
-    const resp = await fetch(`${this.endpoint}/api/chat`, {
+    const resp = await retryFetch(`${this.endpoint}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
