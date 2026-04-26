@@ -230,17 +230,21 @@ describe('PgVectorStore', () => {
       expect(searchCall![1]).toEqual(['[0.1,0.2,0.3]', 5]);
     });
 
-    test('applies scoreThreshold WHERE clause', async () => {
+    test('applies scoreThreshold as raw similarity filter via subquery', async () => {
       mockPool.query.mockResolvedValueOnce({ rows: [] });
 
       const searchOpts: SearchOptions = { topK: 10, scoreThreshold: 0.6 };
       await store.search([1, 2], searchOpts);
 
       const searchCall = mockPool.query.mock.calls.find(
-        (c: any[]) => typeof c[0] === 'string' && c[0].includes('score')
+        (c: any[]) => typeof c[0] === 'string' && c[0].includes('similarity')
       );
       expect(searchCall).toBeDefined();
-      expect(searchCall![0]).toContain("(metadata->>'score')::float >= $3");
+      // Threshold gates on raw similarity via subquery
+      expect(searchCall![0]).toContain('sub.similarity >= $3');
+      // Only raw similarity — no blending with metadata quality score
+      expect(searchCall![0]).not.toContain("(metadata->>'score')");
+      expect(searchCall![0]).not.toContain('raw_similarity');
       expect(searchCall![1]).toEqual(['[1,2]', 10, 0.6]);
     });
   });

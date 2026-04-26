@@ -18,7 +18,10 @@ import type {
   SchemaSerializer,
   SearchOptions,
   SearchConfig,
+  SearchRanker,
+  VectorSearchResult,
 } from '../types';
+import { computeTextMatch, computeRecency } from '../ranking/DefaultSearchRanker';
 import { QueryValidator } from '../validation/QueryValidator';
 import { PromptBuilder } from './PromptBuilder';
 
@@ -43,6 +46,8 @@ export interface DefaultTranslatorDeps {
   serializer: SchemaSerializer;
   compiledMeta: CubeMetaConfig[];
   searchConfig?: SearchConfig;
+  /** Optional ranker for multi-signal re-ranking after vector retrieval. */
+  searchRanker?: SearchRanker;
 }
 
 /**
@@ -108,7 +113,13 @@ export class DefaultTranslator {
       scoreThreshold: sc?.defaultScoreThreshold ?? 0.5,
     };
     const results = await this.deps.vectorStore.search(nlqEmbedding, searchOpts);
-    const relevantCubes = results.map(r => r.metadata.metaJson as unknown as CubeMetaConfig);
+
+    // Step 2b: Multi-signal re-ranking (if a ranker is configured)
+    const rankedResults = this.deps.searchRanker
+      ? await this.rerankResults(results, nlq)
+      : results;
+
+    const relevantCubes = rankedResults.map(r => r.metadata.metaJson as unknown as CubeMetaConfig);
 
     if (relevantCubes.length === 0) {
       return {
@@ -190,7 +201,7 @@ export class DefaultTranslator {
 
       if (validation.valid) {
         const latencyMs = Date.now() - startTime;
-        const confidence = this.computeConfidence(results, retryCount);
+        const confidence = this.computeConfidence(rankedResults, retryCount);
 
         // Save to feedback store (with embedding for similarity retrieval)
         if (this.deps.feedbackStore) {
@@ -200,7 +211,7 @@ export class DefaultTranslator {
               timestamp: new Date(),
               nlq,
               generatedQuery,
-              schemasUsed: results.map(r => r.metadata.cubeName),
+              schemasUsed: rankedResults.map(r => r.metadata.cubeName),
               rating: 'pending',
               latencyMs,
               retryCount,
@@ -214,7 +225,7 @@ export class DefaultTranslator {
         return {
           query: generatedQuery,
           confidence,
-          schemasUsed: results.map(r => r.metadata.cubeName),
+          schemasUsed: rankedResults.map(r => r.metadata.cubeName),
           translationId,
           retryCount,
         };
@@ -237,7 +248,7 @@ export class DefaultTranslator {
           timestamp: new Date(),
           nlq,
           generatedQuery: null,
-          schemasUsed: results.map(r => r.metadata.cubeName),
+          schemasUsed: rankedResults.map(r => r.metadata.cubeName),
           rating: 'pending',
           latencyMs,
           retryCount: maxRetries,
@@ -251,7 +262,7 @@ export class DefaultTranslator {
     return {
       query: null,
       confidence: 0,
-      schemasUsed: results.map(r => r.metadata.cubeName),
+      schemasUsed: rankedResults.map(r => r.metadata.cubeName),
       translationId,
       validationErrors: lastErrors.map(e => e.message),
       retryCount: maxRetries,
@@ -263,5 +274,51 @@ export class DefaultTranslator {
     const avgSimilarity = searchResults.reduce((s: number, r: any) => s + r.similarity, 0) / searchResults.length;
     const retryPenalty = retryCount * 0.1;
     return Math.max(0, Math.min(1, avgSimilarity - retryPenalty));
+  }
+
+  /**
+   * Apply multi-signal re-ranking to vector store results.
+   * Computes text match, quality, feedback, and recency signals,
+   * then delegates to the configured SearchRanker for final scoring.
+   */
+  private async rerankResults(results: VectorSearchResult[], query: string): Promise<VectorSearchResult[]> {
+    const ranker = this.deps.searchRanker!;
+    if (results.length === 0) return results;
+
+    // Optionally compute per-cube feedback scores.
+    let feedbackMap: Map<string, number> | undefined;
+    if (this.deps.feedbackStore) {
+      try {
+        const stats = await this.deps.feedbackStore.getStats();
+        if (stats.topFailingCubes) {
+          feedbackMap = new Map();
+          for (const entry of stats.topFailingCubes) {
+            feedbackMap.set(entry.cube, 1 - entry.failureRate);
+          }
+        }
+      } catch {
+        // Feedback unavailable
+      }
+    }
+
+    const ranked = results.map(r => {
+      const memberNames = [
+        ...((r.metadata.metaJson as any)?.measures || []).map((m: any) => m.name),
+        ...((r.metadata.metaJson as any)?.dimensions || []).map((d: any) => d.name),
+      ];
+
+      const score = ranker.rank({
+        similarity: r.similarity,
+        qualityScore: r.metadata.score || 0,
+        textMatch: computeTextMatch(query, r.metadata.cubeName, memberNames),
+        feedbackScore: feedbackMap?.get(r.metadata.cubeName),
+        recency: computeRecency(r.metadata.lastUpdated),
+      });
+
+      return { ...r, similarity: score };
+    });
+
+    ranked.sort((a, b) => b.similarity - a.similarity);
+    return ranked;
   }
 }

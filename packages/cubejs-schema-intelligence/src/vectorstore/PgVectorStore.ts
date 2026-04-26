@@ -141,26 +141,35 @@ export class PgVectorStore implements VectorStore {
     }
   }
 
-  /** Find the `topK` nearest vectors using the configured distance operator. */
+  /**
+   * Find the `topK` nearest vectors.
+   * `scoreThreshold` gates on raw vector similarity so that low-quality cubes
+   * are never invisible. Post-retrieval ranking is handled by {@link SearchRanker}.
+   */
   async search(queryEmbedding: number[], opts: SearchOptions): Promise<VectorSearchResult[]> {
     const vecStr = `[${queryEmbedding.join(',')}]`;
-    let whereClause = '';
     const params: any[] = [vecStr, opts.topK];
 
+    let query: string;
     if (opts.scoreThreshold !== undefined) {
-      whereClause = `WHERE (metadata->>'score')::float >= $3`;
       params.push(opts.scoreThreshold);
+      // Filter on raw vector similarity, not metadata quality score.
+      query = `SELECT * FROM (
+                 SELECT id, embedding, metadata,
+                        1 - (embedding ${this.operator} $1::vector) AS similarity
+                 FROM ${this.tableName}
+                 ORDER BY embedding ${this.operator} $1::vector
+                 LIMIT $2
+               ) sub WHERE sub.similarity >= $3`;
+    } else {
+      query = `SELECT id, embedding, metadata,
+                      1 - (embedding ${this.operator} $1::vector) AS similarity
+               FROM ${this.tableName}
+               ORDER BY embedding ${this.operator} $1::vector
+               LIMIT $2`;
     }
 
-    const result = await this.pool.query(
-      `SELECT id, embedding, metadata,
-              1 - (embedding ${this.operator} $1::vector) AS similarity
-       FROM ${this.tableName}
-       ${whereClause}
-       ORDER BY embedding ${this.operator} $1::vector
-       LIMIT $2`,
-      params
-    );
+    const result = await this.pool.query(query, params);
 
     return result.rows.map((row: any) => ({
       id: row.id,

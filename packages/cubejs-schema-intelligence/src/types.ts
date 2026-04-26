@@ -928,6 +928,10 @@ export interface SchemaIntelligenceOptions {
   feedback?: FeedbackConfig;
   /** Search behavior config (defaults, diversity, custom strategy). See {@link SearchConfig}. */
   search?: SearchConfig;
+  /** Custom search ranker for post-retrieval re-ranking. See {@link SearchRanker}.
+   *  Supply a `SearchRanker` instance to override the default weighted-blend logic,
+   *  or `SearchRankerWeights` to tune the default ranker's weights. */
+  searchRanker?: SearchRanker | SearchRankerWeights;
   /** Conversation session management. See {@link ConversationConfig}. */
   conversation?: ConversationConfig;
   /** Restrict which views/cubes are exposed to the AI endpoints. Default: all cubes. */
@@ -970,4 +974,82 @@ export interface IntelligenceMetrics {
   feedbackNegative: number;
   /** Count of corrected feedback entries. */
   feedbackCorrected: number;
+}
+
+// ── Search Ranking ──
+
+/**
+ * All signals available for ranking a single search result.
+ * Populated after vector store retrieval and before final ordering.
+ *
+ * Not every signal is always available — rankers must handle `undefined` gracefully
+ * (treat as 0 or skip the weight).
+ */
+export interface SearchRankingSignals {
+  /** Raw vector similarity (0–1, cosine). Core relevance signal. */
+  similarity: number;
+  /** Schema documentation quality score from RuleBasedScorer (0–1).
+   *  Higher = better documented (descriptions, enums, types). */
+  qualityScore: number;
+  /** Direct text match between query tokens and cube/member names (0–1).
+   *  1 = exact cube name match, fractional for partial/member matches. */
+  textMatch: number;
+  /** Aggregated user feedback score for this cube (0–1).
+   *  Based on positive/negative/corrected ratings on past translations involving this cube.
+   *  `undefined` when feedback store is not configured. */
+  feedbackScore?: number;
+  /** Recency of the schema's last indexing (0–1, 1 = just indexed).
+   *  Useful when multiple schema versions coexist. */
+  recency: number;
+}
+
+/**
+ * Configurable weight for each ranking signal.
+ * All weights are normalised to sum to 1 at runtime, so relative ratios matter,
+ * not absolute values.
+ *
+ * @example Boost quality heavily (strict schema hygiene):
+ * ```ts
+ * { similarity: 0.40, qualityScore: 0.30, textMatch: 0.15, feedbackScore: 0.10, recency: 0.05 }
+ * ```
+ */
+export interface SearchRankerWeights {
+  /** Weight for vector similarity. Default: `0.50`. */
+  similarity?: number;
+  /** Weight for schema quality. Default: `0.15`. */
+  qualityScore?: number;
+  /** Weight for direct text/name match. Default: `0.15`. */
+  textMatch?: number;
+  /** Weight for feedback-based scoring. Default: `0.10`. */
+  feedbackScore?: number;
+  /** Weight for recency. Default: `0.10`. */
+  recency?: number;
+}
+
+/**
+ * Strategy for ranking search results after vector retrieval.
+ *
+ * The default implementation ({@link DefaultSearchRanker}) uses a weighted
+ * linear blend of all signals. Override this interface to implement custom
+ * ranking logic — e.g. learning-to-rank, business-rule boosting, or
+ * tenant-specific preferences.
+ *
+ * Injected via `SchemaIntelligenceOptions.searchRanker` or at runtime through
+ * the `SchemaIntelligenceModule` constructor. The downstream service
+ * (atlas.cubejs.service) can supply its own implementation.
+ *
+ * @example Custom ranker that ignores feedback and heavily boosts quality:
+ * ```ts
+ * const myRanker: SearchRanker = {
+ *   rank(signals) {
+ *     return signals.similarity * 0.5
+ *          + signals.qualityScore * 0.4
+ *          + signals.textMatch * 0.1;
+ *   },
+ * };
+ * ```
+ */
+export interface SearchRanker {
+  /** Compute a final ranking score from the available signals. Higher = better. */
+  rank(signals: SearchRankingSignals): number;
 }

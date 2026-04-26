@@ -105,15 +105,20 @@ export class InMemoryVectorStore implements VectorStore {
     }
   }
 
-  /** Find the `topK` most similar vectors. Optionally filter by `scoreThreshold`. */
+  /**
+   * Find the `topK` most similar vectors.
+   * `scoreThreshold` gates on raw vector similarity so that low-quality cubes
+   * are never invisible. Post-retrieval ranking (blending quality, feedback,
+   * text match, recency) is handled by the {@link SearchRanker} layer.
+   */
   async search(queryEmbedding: number[], opts: SearchOptions): Promise<VectorSearchResult[]> {
     const scored: VectorSearchResult[] = [];
 
     for (const record of this.records.values()) {
-      if (opts.scoreThreshold !== undefined && record.metadata.score < opts.scoreThreshold) {
+      const similarity = this.similarityFn(queryEmbedding, record.embedding);
+      if (opts.scoreThreshold !== undefined && similarity < opts.scoreThreshold) {
         continue;
       }
-      const similarity = this.similarityFn(queryEmbedding, record.embedding);
       scored.push({ ...record, similarity });
     }
 

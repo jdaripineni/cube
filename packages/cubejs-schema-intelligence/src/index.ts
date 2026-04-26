@@ -72,6 +72,9 @@ export type {
   FeedbackStore,
   SearchStrategy,
   ConversationStore,
+  SearchRanker,
+  SearchRankingSignals,
+  SearchRankerWeights,
 } from './types';
 
 // ── Built-in Components (for advanced users building custom pipelines) ──
@@ -97,3 +100,4 @@ export { MetricsCollector } from './metrics/MetricsCollector';
 export { ConversationManager } from './conversation/ConversationManager';
 export { InMemoryConversationStore } from './conversation/InMemoryConversationStore';
 export { RedisConversationStore } from './conversation/RedisConversationStore';
+export { DefaultSearchRanker, computeTextMatch, computeRecency } from './ranking/DefaultSearchRanker';

@@ -24,6 +24,8 @@ import type {
   CubeQuery,
   SearchStrategy,
   SearchConfig,
+  SearchRanker,
+  SearchRankerWeights,
 } from './types';
 import { MetricsCollector } from './metrics/MetricsCollector';
 import { ConversationManager } from './conversation/ConversationManager';
@@ -48,6 +50,7 @@ export class SchemaIntelligenceModule {
   private feedbackStore: FeedbackStore | null = null;
   private translator: any | null = null; // DefaultTranslator
   private conversationManager: ConversationManager | null = null;
+  private searchRanker: SearchRanker | null = null;
   private metrics: MetricsCollector;
 
   private lastCompilerId: string | null = null;
@@ -141,6 +144,9 @@ export class SchemaIntelligenceModule {
         : this.options.translator;
       this.llmProvider = await resolveLLMProvider(llmSource);
     }
+
+    // Search ranker: custom instance, custom weights, or default.
+    this.searchRanker = await this.resolveSearchRanker();
 
     this.initialized = true;
   }
@@ -244,23 +250,26 @@ export class SchemaIntelligenceModule {
       scoreThreshold: effectiveThreshold,
     });
 
-    // Step 4: Apply diversity factor (MMR-style)
+    // Step 4: Multi-signal ranking (similarity, quality, text match, feedback, recency)
+    results = await this.rerankResults(results, query);
+
+    // Step 5: Apply diversity factor (MMR-style)
     const diversityFactor = searchConfig?.diversityFactor ?? 1;
     if (diversityFactor < 1 && results.length > 1) {
       results = this.applyMMR(results, embedding, diversityFactor, effectiveTopK);
     }
 
-    // Step 5: Custom re-ranking
+    // Step 6: Custom re-ranking (pluggable SearchStrategy)
     if (strategy?.rerank) {
       results = await strategy.rerank(results, query);
     }
 
-    // Step 6: Custom filtering
+    // Step 7: Custom filtering
     if (strategy?.filter) {
       results = results.filter(r => strategy.filter!(r, query));
     }
 
-    // Step 7: Trim to requested topK
+    // Step 8: Trim to requested topK
     results = results.slice(0, effectiveTopK);
 
     this.metrics.recordSearch(Date.now() - startTime);
@@ -357,6 +366,7 @@ export class SchemaIntelligenceModule {
         serializer: this.serializer!,
         compiledMeta: this.compiledMeta,
         searchConfig: this.options.search,
+        searchRanker: this.searchRanker || undefined,
       });
     }
 
@@ -501,5 +511,71 @@ export class SchemaIntelligenceModule {
     // Default to sqlite
     const { SqliteFeedbackStore } = await import('./feedback/SqliteFeedbackStore');
     return new SqliteFeedbackStore(config);
+  }
+
+  /**
+   * Resolve the search ranker from options:
+   * - If `searchRanker` is a `SearchRanker` instance (has `rank` method), use it directly.
+   * - If it's a `SearchRankerWeights` object, create a `DefaultSearchRanker` with those weights.
+   * - Otherwise, create a `DefaultSearchRanker` with defaults.
+   */
+  private async resolveSearchRanker(): Promise<SearchRanker> {
+    const opt = this.options.searchRanker;
+    if (opt && typeof (opt as SearchRanker).rank === 'function') {
+      return opt as SearchRanker;
+    }
+    const { DefaultSearchRanker } = await import('./ranking/DefaultSearchRanker');
+    if (opt && typeof opt === 'object') {
+      return new DefaultSearchRanker(opt as SearchRankerWeights);
+    }
+    return new DefaultSearchRanker();
+  }
+
+  /**
+   * Apply the search ranker to reorder vector store results.
+   * Computes all ranking signals for each result and re-sorts by final score.
+   */
+  async rerankResults(results: VectorSearchResult[], query: string): Promise<VectorSearchResult[]> {
+    if (!this.searchRanker || results.length === 0) return results;
+
+    const { computeTextMatch, computeRecency } = await import('./ranking/DefaultSearchRanker');
+
+    // Optionally compute per-cube feedback scores from the feedback store.
+    let feedbackMap: Map<string, number> | undefined;
+    if (this.feedbackStore) {
+      feedbackMap = new Map();
+      try {
+        const stats = await this.feedbackStore.getStats();
+        if (stats.topFailingCubes) {
+          for (const entry of stats.topFailingCubes) {
+            // failureRate 0-1 → feedback score: invert so low failure = high score
+            feedbackMap.set(entry.cube, 1 - entry.failureRate);
+          }
+        }
+      } catch {
+        // Feedback unavailable — signals.feedbackScore will be undefined
+      }
+    }
+
+    const ranked = results.map(r => {
+      const memberNames = [
+        ...((r.metadata.metaJson as any)?.measures || []).map((m: any) => m.name),
+        ...((r.metadata.metaJson as any)?.dimensions || []).map((d: any) => d.name),
+      ];
+
+      const signals = {
+        similarity: r.similarity,
+        qualityScore: r.metadata.score || 0,
+        textMatch: computeTextMatch(query, r.metadata.cubeName, memberNames),
+        feedbackScore: feedbackMap?.get(r.metadata.cubeName),
+        recency: computeRecency(r.metadata.lastUpdated),
+      };
+
+      const score = this.searchRanker!.rank(signals);
+      return { ...r, similarity: score };
+    });
+
+    ranked.sort((a, b) => b.similarity - a.similarity);
+    return ranked;
   }
 }
