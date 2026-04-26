@@ -87,14 +87,19 @@ export class QueryValidator {
     // Validate measures
     for (const measure of query.measures || []) {
       if (!this.measureSet.has(measure)) {
-        const suggestion = this.findClosest(measure, this.measureSet);
         errors.push({
           type: 'unknown_member',
           message: `Unknown measure: ${measure}`,
           member: measure,
         });
-        if (suggestion) {
-          suggestions.push(`Did you mean '${suggestion}' instead of '${measure}'?`);
+        // Cross-check: is this actually a dimension?
+        if (this.dimensionSet.has(measure)) {
+          suggestions.push(`'${measure}' is a dimension, not a measure. Move it to the dimensions array.`);
+        } else {
+          const suggestion = this.findClosest(measure, this.measureSet);
+          if (suggestion) {
+            suggestions.push(`Did you mean '${suggestion}' instead of '${measure}'?`);
+          }
         }
       }
     }
@@ -102,14 +107,19 @@ export class QueryValidator {
     // Validate dimensions
     for (const dim of query.dimensions || []) {
       if (!this.dimensionSet.has(dim)) {
-        const suggestion = this.findClosest(dim, this.dimensionSet);
         errors.push({
           type: 'unknown_member',
           message: `Unknown dimension: ${dim}`,
           member: dim,
         });
-        if (suggestion) {
-          suggestions.push(`Did you mean '${suggestion}' instead of '${dim}'?`);
+        // Cross-check: is this actually a measure?
+        if (this.measureSet.has(dim)) {
+          suggestions.push(`'${dim}' is a measure, not a dimension. Move it to the measures array.`);
+        } else {
+          const suggestion = this.findClosest(dim, this.dimensionSet);
+          if (suggestion) {
+            suggestions.push(`Did you mean '${suggestion}' instead of '${dim}'?`);
+          }
         }
       }
     }
