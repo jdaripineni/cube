@@ -444,15 +444,22 @@ export class SchemaIntelligenceModule {
       return new OllamaEmbeddingProvider({ provider: 'ollama', model: config });
     }
 
-    // Object config
+    // Object config — normalize endpoint URL for the target provider before constructing.
+    const { normalizeEndpoint } = await import('./llm/normalizeEndpoint');
+    const normalized = { ...config };
+    if (normalized.endpoint) {
+      const providerType = normalized.provider === 'ollama' ? 'ollama-embedding' as const : 'openai-embedding' as const;
+      normalized.endpoint = normalizeEndpoint(normalized.endpoint, providerType);
+    }
+
     switch (config.provider) {
       case 'openai': {
         const { OpenAIEmbeddingProvider } = await import('./embedding/OpenAIEmbeddingProvider');
-        return new OpenAIEmbeddingProvider(config);
+        return new OpenAIEmbeddingProvider(normalized);
       }
       case 'ollama': {
         const { OllamaEmbeddingProvider } = await import('./embedding/OllamaEmbeddingProvider');
-        return new OllamaEmbeddingProvider(config);
+        return new OllamaEmbeddingProvider(normalized);
       }
       case 'local':
       default: {

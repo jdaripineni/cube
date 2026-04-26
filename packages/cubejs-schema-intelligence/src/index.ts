@@ -90,6 +90,8 @@ export { SqliteFeedbackStore } from './feedback/SqliteFeedbackStore';
 export { OpenAILLMProvider, OllamaLLMProvider, resolveLLMProvider, MODEL_REGISTRY } from './llm/LLMProviders';
 export { retryFetch } from './llm/retryFetch';
 export type { RetryOptions } from './llm/retryFetch';
+export { normalizeEndpoint } from './llm/normalizeEndpoint';
+export type { ProviderType } from './llm/normalizeEndpoint';
 export { AgentsConfigLoader } from './config/AgentsConfigLoader';
 export { MetricsCollector } from './metrics/MetricsCollector';
 export { ConversationManager } from './conversation/ConversationManager';
