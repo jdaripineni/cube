@@ -6,6 +6,7 @@
 
 import type { LLMProvider, LLMConfig, CompletionOptions, TranslatorConfig } from '../types';
 import { retryFetch } from './retryFetch';
+import { normalizeEndpoint } from './normalizeEndpoint';
 
 // ── Predefined model name → provider config mapping ──
 // Aligned with Cube Cloud's agents/config.yml `llm` values.
@@ -200,7 +201,12 @@ export async function resolveLLMProvider(config?: TranslatorConfig): Promise<LLM
 
   // 1. Explicit object config
   if (llmConfig && typeof llmConfig === 'object') {
-    const c = llmConfig as LLMConfig;
+    const c = { ...llmConfig } as LLMConfig;
+    // Normalize endpoint URL for the target provider's API path convention.
+    if (c.endpoint) {
+      const providerType = c.provider === 'ollama' ? 'ollama-llm' : 'openai-llm';
+      c.endpoint = normalizeEndpoint(c.endpoint, providerType);
+    }
     switch (c.provider) {
       case 'openai':
         return new OpenAILLMProvider(c);
