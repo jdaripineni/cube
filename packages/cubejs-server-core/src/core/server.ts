@@ -559,6 +559,20 @@ export class CubejsServerCore {
         const mod = new SchemaIntelligenceModule({ ...opts, enabled: true }, this.logger);
         await mod.initialize();
         compilerApi.schemaIntelligenceModule = mod;
+
+        // If schemas are already compiled (race: compilation ran before module was attached),
+        // trigger indexing now so /search, /translate, /scores work immediately.
+        try {
+          const compilers = await compilerApi.getCompilers();
+          const cubes = compilers.metaTransformer?.cubes;
+          if (cubes?.length && compilers.compilerId) {
+            mod.onSchemaCompiled(cubes, compilers.compilerId).catch((e: any) => {
+              this.logger('Schema Intelligence post-attach indexing error', { error: (e.stack || e).toString() });
+            });
+          }
+        } catch {
+          // Compilation not ready yet — will be indexed by the normal compileSchema path
+        }
       } catch (e: any) {
         this.logger('Schema Intelligence Init Error', { error: e.message });
       }

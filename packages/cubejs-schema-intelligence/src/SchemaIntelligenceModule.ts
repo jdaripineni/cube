@@ -315,6 +315,13 @@ export class SchemaIntelligenceModule {
     return denom === 0 ? 0 : dot / denom;
   }
 
+  /** Return the number of vectors currently stored (0 = not yet indexed). */
+  async getVectorCount(): Promise<number> {
+    if (!this.enabled || !this.vectorStore) return 0;
+    await this.initialize();
+    return this.vectorStore.count();
+  }
+
   async getScores(cubeName?: string): Promise<ScoreResult[]> {
     if (!this.enabled) return [];
     await this.initialize();
@@ -361,18 +368,24 @@ export class SchemaIntelligenceModule {
   }
 
   async submitFeedback(translationId: string, rating: 'positive' | 'negative' | 'corrected', correctedQuery?: CubeQuery): Promise<void> {
-    if (!this.enabled || !this.feedbackStore) return;
+    if (!this.enabled) return;
+    await this.initialize();
+    if (!this.feedbackStore) return;
     await this.feedbackStore.submitFeedback(translationId, rating, correctedQuery);
     this.metrics.recordFeedback(rating);
   }
 
   async getFeedbackStats(): Promise<FeedbackStats | null> {
-    if (!this.enabled || !this.feedbackStore) return null;
+    if (!this.enabled) return null;
+    await this.initialize();
+    if (!this.feedbackStore) return null;
     return this.feedbackStore.getStats();
   }
 
   async getFeedbackEntries(opts: FeedbackQueryOptions): Promise<FeedbackQueryResult | null> {
-    if (!this.enabled || !this.feedbackStore) return null;
+    if (!this.enabled) return null;
+    await this.initialize();
+    if (!this.feedbackStore) return null;
     return this.feedbackStore.queryFeedback(opts);
   }
 
@@ -380,6 +393,7 @@ export class SchemaIntelligenceModule {
     if (!this.enabled) {
       return { enabled: false };
     }
+    await this.initialize();
 
     const count = this.vectorStore ? await this.vectorStore.count() : 0;
     const healthy = this.vectorStore ? await this.vectorStore.healthCheck() : false;

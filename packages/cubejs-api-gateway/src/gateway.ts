@@ -518,6 +518,20 @@ class ApiGateway {
      * ai scope (schema-intelligence)                                *
      *************************************************************** */
 
+    // Helper: ensure schemas are compiled and indexed in the vector store before AI queries.
+    // Without this, /search, /translate, and /scores return empty results when hit before
+    // any regular query triggers schema compilation via onSchemaCompiled().
+    const ensureAiIndexed = async (compilerApi: any, intelligence: any, context: any) => {
+      const vectorCount = await intelligence.getVectorCount();
+      if (vectorCount === 0) {
+        const { cubes, compilerId } = await compilerApi.metaConfig(context, {
+          includeCompilerId: true,
+          skipVisibilityPatch: true,
+        });
+        await intelligence.onSchemaCompiled(cubes, compilerId);
+      }
+    };
+
     app.post(`${this.basePath}/v1/ai/search`, jsonParser, userMiddlewares, userAsyncHandler(async (req: any, res) => {
       await this.assertApiScope('ai', req.context?.securityContext);
       const compilerApi = await this.getCompilerApi(req.context);
@@ -531,6 +545,7 @@ class ApiGateway {
         res.status(400).json({ error: 'Missing required field: query (string)' });
         return;
       }
+      await ensureAiIndexed(compilerApi, intelligence, req.context);
       const results = await intelligence.search(query, limit || 5);
       res.json({ results });
     }));
@@ -572,6 +587,7 @@ class ApiGateway {
       }
       // If conversationHistory was provided without conversationId, we use it as-is (stateless mode)
 
+      await ensureAiIndexed(compilerApi, intelligence, req.context);
       const context = {
         securityContext: req.context?.securityContext,
         conversationHistory: history,
@@ -612,7 +628,9 @@ class ApiGateway {
         res.status(404).json({ error: 'Schema intelligence is not enabled' });
         return;
       }
-      const scores = await intelligence.getScores();
+      await ensureAiIndexed(compilerApi, intelligence, req.context);
+      const cubeName = req.query.cube as string | undefined;
+      const scores = await intelligence.getScores(cubeName);
       res.json({ scores });
     }));
 
