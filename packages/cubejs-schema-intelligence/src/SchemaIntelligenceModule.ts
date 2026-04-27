@@ -154,16 +154,23 @@ export class SchemaIntelligenceModule {
   /**
    * Called when schema compilation produces new metadata.
    * Triggers re-indexing if compilerId has changed.
+   *
+   * The compiler passes `TransformedCube[]` (`{ config: { name, measures, ... } }`)
+   * but this module expects flat `CubeMetaConfig[]` (`{ name, measures, ... }`).
+   * Normalize here so the rest of the pipeline sees a consistent shape.
    */
   async onSchemaCompiled(cubes: CubeMetaConfig[], compilerId: string): Promise<void> {
     if (!this.enabled) return;
 
     if (this.lastCompilerId === compilerId) return;
     this.lastCompilerId = compilerId;
-    this.compiledMeta = cubes;
+
+    // Normalize: unwrap { config: { ... } } → { ... } when compiler sends TransformedCube[].
+    const normalized = cubes.map(c => (c as any).config && !(c as any).measures ? (c as any).config : c) as CubeMetaConfig[];
+    this.compiledMeta = normalized;
 
     if (this.options.reindexOnSchemaChange !== false) {
-      await this.reindex(cubes);
+      await this.reindex(normalized);
     }
   }
 
