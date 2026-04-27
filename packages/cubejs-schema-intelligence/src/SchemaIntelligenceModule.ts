@@ -558,17 +558,19 @@ export class SchemaIntelligenceModule {
     }
 
     const ranked = results.map(r => {
+      const meta = r.metadata || {} as any;
+      const metaJson = meta.metaJson as any;
       const memberNames = [
-        ...((r.metadata.metaJson as any)?.measures || []).map((m: any) => m.name),
-        ...((r.metadata.metaJson as any)?.dimensions || []).map((d: any) => d.name),
+        ...((metaJson?.measures || []).map((m: any) => m.name).filter(Boolean)),
+        ...((metaJson?.dimensions || []).map((d: any) => d.name).filter(Boolean)),
       ];
 
       const signals = {
         similarity: r.similarity,
-        qualityScore: r.metadata.score || 0,
-        textMatch: computeTextMatch(query, r.metadata.cubeName, memberNames),
-        feedbackScore: feedbackMap?.get(r.metadata.cubeName),
-        recency: computeRecency(r.metadata.lastUpdated),
+        qualityScore: meta.score || 0,
+        textMatch: computeTextMatch(query, meta.cubeName, memberNames),
+        feedbackScore: meta.cubeName ? feedbackMap?.get(meta.cubeName) : undefined,
+        recency: computeRecency(meta.lastUpdated),
       };
 
       const score = this.searchRanker!.rank(signals);

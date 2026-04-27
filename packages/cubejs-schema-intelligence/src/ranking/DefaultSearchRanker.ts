@@ -87,6 +87,7 @@ export class DefaultSearchRanker implements SearchRanker {
  * Returns 0–1: 1 = query contains the exact cube name, fractional for member matches.
  */
 export function computeTextMatch(query: string, cubeName: string, memberNames: string[]): number {
+  if (!query || !cubeName) return 0;
   const q = query.toLowerCase();
   // Cube name match is the strongest signal.
   const shortName = cubeName.includes('.') ? cubeName.split('.').pop()! : cubeName;
@@ -132,8 +133,9 @@ export function computeTextMatch(query: string, cubeName: string, memberNames: s
  * Default half-life: 7 days.
  */
 export function computeRecency(lastUpdated: string, halfLifeMs = 7 * 24 * 60 * 60 * 1000): number {
+  if (!lastUpdated) return 0.5;
   const age = Date.now() - new Date(lastUpdated).getTime();
-  if (age <= 0) return 1;
+  if (age <= 0 || Number.isNaN(age)) return 1;
   // Exponential decay: score = 2^(-age/halfLife)
   return Math.pow(2, -age / halfLifeMs);
 }
