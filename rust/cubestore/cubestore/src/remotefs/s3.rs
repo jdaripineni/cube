@@ -16,6 +16,8 @@ use std::env;
 use std::fmt;
 use std::fmt::Formatter;
 use std::path::{Path, PathBuf};
+use std::process;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tempfile::{NamedTempFile, PathPersistError};
@@ -33,6 +35,11 @@ pub struct S3RemoteFs {
     /// STS AssumeRoleWithWebIdentity with the JWT inside it.
     web_identity_token_file: Option<String>,
     web_identity_role_arn: Option<String>,
+    /// Consecutive S3 auth failures across all operations. Reset on success.
+    /// When this reaches `max_auth_retries`, the process exits.
+    consecutive_auth_failures: AtomicU32,
+    /// Max consecutive auth retry failures before exit. From CUBESTORE_S3_MAX_AUTH_RETRIES (default 1).
+    max_auth_retries: u32,
 }
 
 impl fmt::Debug for S3RemoteFs {
@@ -89,6 +96,10 @@ impl S3RemoteFs {
         let region = region.parse::<Region>().map_err(|e| {
             CubeError::internal(format!("Failed to parse Region '{}': {}", region, e))
         })?;
+        let max_auth_retries = env::var("CUBESTORE_S3_MAX_AUTH_RETRIES")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1);
         let bucket = Bucket::new(&bucket_name, region.clone(), credentials)?;
         let fs = Arc::new(Self {
             dir,
@@ -97,7 +108,13 @@ impl S3RemoteFs {
             delete_mut: Mutex::new(()),
             web_identity_token_file: token_file,
             web_identity_role_arn: role_arn,
+            consecutive_auth_failures: AtomicU32::new(0),
+            max_auth_retries,
         });
+        info!(
+            "S3RemoteFs: max auth retries before exit = {}",
+            max_auth_retries
+        );
         spawn_creds_refresh_loop(access_key, secret_key, bucket_name, region, &fs);
 
         Ok(fs)
@@ -144,6 +161,30 @@ impl S3RemoteFs {
         self.bucket.swap(Arc::new(new_bucket));
         info!("Forced S3 credential refresh completed successfully");
         Ok(())
+    }
+
+    /// Reset the consecutive auth failure counter (called on any successful S3 operation).
+    fn reset_auth_failures(&self) {
+        self.consecutive_auth_failures.store(0, Ordering::Relaxed);
+    }
+
+    /// Record a persistent auth failure (retry also failed). If the threshold is reached,
+    /// exit the process so Kubernetes restarts the pod with fresh IRSA tokens.
+    fn record_auth_failure(&self, operation: &str, status: u16) {
+        let count = self.consecutive_auth_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        log::error!(
+            "S3 {} auth error (status {}) persisted after credential refresh. \
+             Consecutive auth failures: {}/{}",
+            operation, status, count, self.max_auth_retries
+        );
+        if count >= self.max_auth_retries {
+            log::error!(
+                "FATAL: {} consecutive S3 auth failures reached threshold. \
+                 Exiting to trigger pod restart.",
+                count
+            );
+            process::exit(1);
+        }
     }
 }
 
@@ -308,7 +349,13 @@ impl RemoteFs for S3RemoteFs {
                 let retry_status = bucket
                     .put_object_stream(&mut temp_upload_file, &path)
                     .await?;
-                if retry_status != 200 {
+                if Self::is_auth_error(retry_status) {
+                    self.record_auth_failure("upload", retry_status);
+                    return Err(CubeError::user(format!(
+                        "S3 upload auth error persisted after credential refresh: {}",
+                        retry_status
+                    )));
+                } else if retry_status != 200 {
                     return Err(CubeError::user(format!(
                         "S3 upload returned non OK status after credential refresh: {}",
                         retry_status
@@ -321,6 +368,7 @@ impl RemoteFs for S3RemoteFs {
                 )));
             }
 
+            self.reset_auth_failures();
             info!("Uploaded {} ({:?})", remote_path, time.elapsed()?);
         }
         let size = fs::metadata(&temp_upload_path).await?.len();
@@ -390,7 +438,13 @@ impl RemoteFs for S3RemoteFs {
                 let retry_status = bucket
                     .get_object_stream(path.as_str(), &mut writter)
                     .await?;
-                if retry_status != 200 {
+                if Self::is_auth_error(retry_status) {
+                    self.record_auth_failure("download", retry_status);
+                    return Err(CubeError::user(format!(
+                        "S3 download auth error persisted after credential refresh: {}",
+                        retry_status
+                    )));
+                } else if retry_status != 200 {
                     return Err(CubeError::user(format!(
                         "S3 download returned non OK status after credential refresh: {}",
                         retry_status
@@ -403,6 +457,7 @@ impl RemoteFs for S3RemoteFs {
                 )));
             }
 
+            self.reset_auth_failures();
             writter.flush().await?;
 
             cube_ext::spawn_blocking(move || -> Result<(), PathPersistError> {
@@ -439,10 +494,17 @@ impl RemoteFs for S3RemoteFs {
             self.force_refresh_credentials()?;
             let bucket = self.bucket.load();
             let retry_res = bucket.delete_object(&path).await?;
-            if retry_res.status_code() != 204 {
+            let retry_status = retry_res.status_code();
+            if Self::is_auth_error(retry_status) {
+                self.record_auth_failure("delete", retry_status);
+                return Err(CubeError::user(format!(
+                    "S3 delete auth error persisted after credential refresh: {}",
+                    retry_status
+                )));
+            } else if retry_status != 204 {
                 return Err(CubeError::user(format!(
                     "S3 delete returned non OK status after credential refresh: {}",
-                    retry_res.status_code()
+                    retry_status
                 )));
             }
         } else if status != 204 {
@@ -451,6 +513,8 @@ impl RemoteFs for S3RemoteFs {
                 status
             )));
         }
+
+        self.reset_auth_failures();
 
         let _guard = acquire_lock("delete file", self.delete_mut.lock()).await?;
         let local = self.dir.as_path().join(&remote_path);
