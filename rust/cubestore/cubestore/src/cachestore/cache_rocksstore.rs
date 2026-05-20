@@ -15,10 +15,11 @@ use std::collections::HashMap;
 use std::env;
 
 use crate::metastore::{
-    BaseRocksStoreFs, BatchPipe, DbTableRef, IdRow, MetaStoreEvent, MetaStoreFs, RocksPropertyRow,
-    RocksStore, RocksStoreDetails, RocksStoreRWLoop, RocksTable, RocksTableStats,
+    BaseRocksStoreFs, BatchPipe, DbTableRef, IdRow, MemorySequence, MetaStoreEvent, MetaStoreFs,
+    RocksPropertyRow, RocksStore, RocksStoreDetails, RocksStoreRWLoop, RocksTable, RocksTableStats,
 };
 use crate::remotefs::LocalDirRemoteFs;
+use crate::util::time_span::warn_long;
 use crate::util::WorkerLoop;
 use crate::{app_metrics, CubeError};
 use async_trait::async_trait;
@@ -186,6 +187,8 @@ pub struct RocksCacheStore {
     upload_loop: Arc<WorkerLoop>,
     metrics_loop: Arc<WorkerLoop>,
     rw_loop_queue_cf: RocksStoreRWLoop,
+    queue_rw_shards: crate::metastore::sharded_rw_loop::ShardedRocksStoreRWLoop,
+    queue_active_counters: Arc<crate::cachestore::queue_active_counters::QueueActiveCounters>,
 }
 
 impl RocksCacheStore {
@@ -219,12 +222,27 @@ impl RocksCacheStore {
     fn new_from_store(store: Arc<RocksStore>) -> Result<Arc<Self>, CubeError> {
         let cache_eviction_manager = CacheEvictionManager::new(&store.config);
 
+        // Default to 1 shard (preserves existing single-threaded behavior).
+        // Set CUBESTORE_QUEUE_RW_WORKERS=8 (or higher) to enable parallel queue processing.
+        let num_queue_workers: usize = std::env::var("CUBESTORE_QUEUE_RW_WORKERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+
         Ok(Arc::new(Self {
             store,
             cache_eviction_manager,
             upload_loop: Arc::new(WorkerLoop::new("Cachestore upload")),
             metrics_loop: Arc::new(WorkerLoop::new("Cachestore metrics")),
             rw_loop_queue_cf: RocksStoreRWLoop::new("cachestore", "queue"),
+            queue_rw_shards: crate::metastore::sharded_rw_loop::ShardedRocksStoreRWLoop::new(
+                "cachestore",
+                "queue-shard",
+                num_queue_workers,
+            ),
+            queue_active_counters: Arc::new(
+                crate::cachestore::queue_active_counters::QueueActiveCounters::new(),
+            ),
         }))
     }
 
@@ -261,6 +279,39 @@ impl RocksCacheStore {
 
     async fn run_eviction(&self) -> Result<EvictionResult, CubeError> {
         self.cache_eviction_manager.run_eviction(&self.store).await
+    }
+
+    /// Rebuild the in-memory active queue counters from RocksDB state.
+    /// Must be called once at startup before processing queue operations.
+    pub async fn rebuild_queue_active_counters(&self) -> Result<(), CubeError> {
+        let prefix_counts = self
+            .read_operation_queue("rebuild_active_counters", move |db_ref| {
+                let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+                let mut counts: HashMap<String, u32> = HashMap::new();
+
+                // Scan all active items and count by prefix
+                let all_items = queue_schema.all_rows()?;
+                for item in all_items {
+                    if item.get_row().get_status() == &QueueItemStatus::Active {
+                        let prefix = item
+                            .get_row()
+                            .get_prefix()
+                            .clone()
+                            .unwrap_or_default();
+                        *counts.entry(prefix).or_insert(0) += 1;
+                    }
+                }
+
+                Ok(counts)
+            })
+            .await?;
+
+        self.queue_active_counters.rebuild(prefix_counts).await;
+        log::info!(
+            "Rebuilt queue active counters with {} prefixes",
+            self.queue_active_counters.get_count("").await
+        );
+        Ok(())
     }
 
     pub fn spawn_processing_loops(self: Arc<Self>) -> Vec<JoinHandle<Result<(), CubeError>>> {
@@ -509,6 +560,128 @@ impl RocksCacheStore {
             .await
     }
 
+    /// Sharded write operation: routes to one of N worker threads based on the routing key.
+    /// Operations with the same routing_key execute sequentially; different keys run in parallel.
+    /// Use this for per-item operations (heartbeat, ack, add) where the routing_key is the item path.
+    #[inline(always)]
+    pub async fn write_operation_queue_sharded<F, R>(
+        &self,
+        op_name: &'static str,
+        routing_key: &str,
+        f: F,
+    ) -> Result<R, CubeError>
+    where
+        F: for<'a> FnOnce(DbTableRef<'a>, &mut BatchPipe<'a>) -> Result<R, CubeError>
+            + Send
+            + Sync
+            + 'static,
+        R: Send + Sync + 'static,
+    {
+        let db = self.store.db.clone();
+        let mem_seq = MemorySequence::new(self.store.seq_store.clone());
+        let store_name = self.store.details.get_name();
+        let listeners = self.store.listeners.clone();
+        let write_notify = self.store.write_notify.clone();
+
+        let span_name = format!(
+            "{}(queue-shard) write operation: {}",
+            store_name, op_name
+        );
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(R, Vec<MetaStoreEvent>), CubeError>>();
+
+        let res = self
+            .queue_rw_shards
+            .schedule_keyed(
+                routing_key,
+                Box::new(move || {
+                    let db_span = warn_long(&span_name, Duration::from_millis(100));
+
+                    let mut batch = BatchPipe::new(db.as_ref());
+                    let snapshot = db.snapshot();
+                    let res = f(
+                        DbTableRef {
+                            db: db.as_ref(),
+                            snapshot: &snapshot,
+                            mem_seq,
+                            start_time: Utc::now(),
+                        },
+                        &mut batch,
+                    );
+                    match res {
+                        Ok(res) => {
+                            let (events, callback) = batch.batch_write_rows()?;
+                            if let Some(cb) = callback {
+                                cb(&());
+                            }
+                            let _ = tx.send(Ok((res, events)));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                        }
+                    }
+
+                    std::mem::drop(db_span);
+                    Ok(())
+                }),
+            )
+            .await;
+
+        if let Err(e) = res {
+            return Err(CubeError::internal(format!(
+                "Error during scheduling sharded write task: {}",
+                e
+            )));
+        }
+
+        let res = rx.await.map_err(|err| {
+            CubeError::internal(format!(
+                "Unable to receive result for sharded write task: {}",
+                err
+            ))
+        })?;
+        let (spawn_res, events) = res?;
+
+        write_notify.notify_waiters();
+
+        if !events.is_empty() {
+            for listener in listeners.read().await.clone().iter_mut() {
+                for event in events.iter() {
+                    listener.send(event.clone())?;
+                }
+            }
+        }
+        Ok(spawn_res)
+    }
+
+    /// Read operation that bypasses the RW loop entirely using a RocksDB snapshot.
+    /// Safe for read-only operations (LIST, PENDING, ACTIVE, STALLED, ORPHANED).
+    #[inline(always)]
+    pub async fn read_operation_queue_direct<F, R>(
+        &self,
+        _op_name: &'static str,
+        f: F,
+    ) -> Result<R, CubeError>
+    where
+        F: for<'a> FnOnce(DbTableRef<'a>) -> Result<R, CubeError> + Send + Sync + 'static,
+        R: Send + Sync + 'static,
+    {
+        let db = self.store.db.clone();
+        let mem_seq = MemorySequence::new(self.store.seq_store.clone());
+
+        tokio::task::spawn_blocking(move || {
+            let snapshot = db.snapshot();
+            f(DbTableRef {
+                db: db.as_ref(),
+                snapshot: &snapshot,
+                mem_seq,
+                start_time: Utc::now(),
+            })
+        })
+        .await
+        .map_err(|e| CubeError::internal(format!("Join error in direct read: {}", e)))?
+    }
+
     #[inline(always)]
     pub async fn read_operation_queue<F, R>(
         &self,
@@ -710,6 +883,15 @@ impl QueueKey {
         match self {
             QueueKey::ById(_) => true,
             _ => false,
+        }
+    }
+
+    /// Returns a routing key for sharded write operations.
+    /// Operations on the same queue item will route to the same shard.
+    pub(crate) fn to_routing_key(&self) -> String {
+        match self {
+            QueueKey::ById(id) => id.to_string(),
+            QueueKey::ByPath(path) => path.clone(),
         }
     }
 }
@@ -1377,7 +1559,8 @@ impl CacheStore for RocksCacheStore {
     }
 
     async fn queue_heartbeat(&self, key: QueueKey) -> Result<(), CubeError> {
-        self.write_operation_queue("queue_heartbeat", move |db_ref, batch_pipe| {
+        let routing_key = key.to_routing_key();
+        self.write_operation_queue_sharded("queue_heartbeat", &routing_key, move |db_ref, batch_pipe| {
             let queue_schema = QueueItemRocksTable::new(db_ref.clone());
             let id_row_opt = queue_schema.get_row_by_key(key.clone())?;
 
@@ -1402,110 +1585,175 @@ impl CacheStore for RocksCacheStore {
         allow_concurrency: u32,
         caller_process_id: Option<String>,
     ) -> Result<QueueRetrieveResponse, CubeError> {
-        self.write_operation_queue("queue_retrieve_by_path", move |db_ref, batch_pipe| {
-            let queue_schema = QueueItemRocksTable::new(db_ref.clone());
-            let prefix = QueueItem::parse_path(path.clone())
-                .0
-                .unwrap_or("".to_string());
-            let mut pending = queue_schema.count_rows_by_index(
-                &QueueItemIndexKey::ByPrefixAndStatus(prefix.clone(), QueueItemStatus::Pending),
-                &QueueItemRocksIndex::ByPrefixAndStatus,
-            )?;
+        let prefix = QueueItem::parse_path(path.clone())
+            .0
+            .unwrap_or("".to_string());
 
-            let mut active: Vec<String> = queue_schema
-                .get_rows_by_index(
-                    &QueueItemIndexKey::ByPrefixAndStatus(prefix, QueueItemStatus::Active),
+        // Acquire per-prefix lock so RETRIEVEs within the same prefix are serialized,
+        // but different prefixes can proceed in parallel.
+        let retrieve_lock = self.queue_active_counters.get_retrieve_lock(&prefix).await;
+        let _guard = retrieve_lock.lock().await;
+
+        // Fast-path: check atomic counter before touching RocksDB
+        let active_count = self.queue_active_counters.get_count(&prefix).await;
+        if active_count >= allow_concurrency {
+            // Still need pending count and active list for the response.
+            // Use a direct read (no RW loop) to get them.
+            let prefix_clone = prefix.clone();
+            let (pending, active) = self
+                .read_operation_queue_direct("queue_retrieve_check", move |db_ref| {
+                    let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+                    let pending = queue_schema.count_rows_by_index(
+                        &QueueItemIndexKey::ByPrefixAndStatus(
+                            prefix_clone.clone(),
+                            QueueItemStatus::Pending,
+                        ),
+                        &QueueItemRocksIndex::ByPrefixAndStatus,
+                    )?;
+                    let active: Vec<String> = queue_schema
+                        .get_rows_by_index(
+                            &QueueItemIndexKey::ByPrefixAndStatus(
+                                prefix_clone,
+                                QueueItemStatus::Active,
+                            ),
+                            &QueueItemRocksIndex::ByPrefixAndStatus,
+                        )?
+                        .into_iter()
+                        .map(|item| item.into_row().key)
+                        .collect();
+                    Ok((pending, active))
+                })
+                .await?;
+            return Ok(QueueRetrieveResponse::NotEnoughConcurrency { pending, active });
+        }
+
+        // Proceed with the actual retrieve using sharded write (routes by item path)
+        let counters = self.queue_active_counters.clone();
+        let prefix_for_decrement = prefix.clone();
+        let result = self
+            .write_operation_queue_sharded("queue_retrieve_by_path", &path, move |db_ref, batch_pipe| {
+                let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+                let prefix_inner = QueueItem::parse_path(path.clone())
+                    .0
+                    .unwrap_or("".to_string());
+                let mut pending = queue_schema.count_rows_by_index(
+                    &QueueItemIndexKey::ByPrefixAndStatus(
+                        prefix_inner.clone(),
+                        QueueItemStatus::Pending,
+                    ),
                     &QueueItemRocksIndex::ByPrefixAndStatus,
-                )?
-                .into_iter()
-                .map(|item| item.into_row().key)
-                .collect();
-            if active.len() >= (allow_concurrency as usize) {
-                return Ok(QueueRetrieveResponse::NotEnoughConcurrency { pending, active });
-            }
+                )?;
 
-            let id_row = queue_schema.get_single_opt_row_by_index(
-                &QueueItemIndexKey::ByPath(path.clone()),
-                &QueueItemRocksIndex::ByPath,
-            )?;
-            let id_row = if let Some(id_row) = id_row {
-                id_row
-            } else {
-                return Ok(QueueRetrieveResponse::NotFound { pending, active });
-            };
+                let mut active: Vec<String> = queue_schema
+                    .get_rows_by_index(
+                        &QueueItemIndexKey::ByPrefixAndStatus(
+                            prefix_inner,
+                            QueueItemStatus::Active,
+                        ),
+                        &QueueItemRocksIndex::ByPrefixAndStatus,
+                    )?
+                    .into_iter()
+                    .map(|item| item.into_row().key)
+                    .collect();
 
-            if id_row.get_row().get_status() == &QueueItemStatus::Pending {
-                if id_row.get_row().get_exclusive() {
-                    match (id_row.get_row().get_process_id(), &caller_process_id) {
-                        (Some(_), None) => return Err(CubeError::user(
-                            "QUEUE RETRIEVE requires a process_id in the connection context (x-process-id header)".to_string(),
-                        )),
-                        (None, Some(_)) => {
-                            log::warn!("Incorrect queue_item with exclusive flag, empty process_id, id: {:?}", caller_process_id);
-
-                            return Ok(QueueRetrieveResponse::NotFound { pending, active })
-                        }
-                        (Some(item_process_id), Some(caller_id)) => if item_process_id == caller_id {
-                            // OK, caller matches the exclusive item owner
-                        } else {
-                            return Ok(QueueRetrieveResponse::ExclusiveAccessFailed {
-                                pending,
-                                active,
-                            })
-                        },
-                        (None, None) => {
-                            // No process_id on item and no caller — allow retrieval
-                        }
-                    }
+                // Double-check against RocksDB ground truth (counter may be slightly stale)
+                if active.len() >= (allow_concurrency as usize) {
+                    return Ok(QueueRetrieveResponse::NotEnoughConcurrency { pending, active });
                 }
 
-                let mut new = id_row.get_row().clone();
-                new.status = QueueItemStatus::Active;
-                // It's important to insert heartbeat, because
-                // without that created datetime will be used for orphaned filtering
-                new.update_heartbeat();
-
-                let queue_payload_schema = QueueItemPayloadRocksTable::new(db_ref.clone());
-
-                let res =
-                    queue_schema.update(id_row.get_id(), new, id_row.get_row(), batch_pipe)?;
-                let payload = if let Some(r) = queue_payload_schema.get_row(res.get_id())? {
-                    r.into_row().value
+                let id_row = queue_schema.get_single_opt_row_by_index(
+                    &QueueItemIndexKey::ByPath(path.clone()),
+                    &QueueItemRocksIndex::ByPath,
+                )?;
+                let id_row = if let Some(id_row) = id_row {
+                    id_row
                 } else {
-                    error!(
-                        "Unable to find payload for queue item, id = {}",
-                        res.get_id()
-                    );
-
-                    queue_schema.delete_row(res, batch_pipe)?;
-
                     return Ok(QueueRetrieveResponse::NotFound { pending, active });
                 };
 
-                active.push(res.get_row().get_key().clone());
-                pending -= 1;
-                Ok(QueueRetrieveResponse::Success {
-                    id: id_row.get_id(),
-                    payload,
-                    item: res.into_row(),
-                    pending,
-                    active,
-                })
-            } else {
-                Ok(QueueRetrieveResponse::LockFailed { pending, active })
+                if id_row.get_row().get_status() == &QueueItemStatus::Pending {
+                    if id_row.get_row().get_exclusive() {
+                        match (id_row.get_row().get_process_id(), &caller_process_id) {
+                            (Some(_), None) => return Err(CubeError::user(
+                                "QUEUE RETRIEVE requires a process_id in the connection context (x-process-id header)".to_string(),
+                            )),
+                            (None, Some(_)) => {
+                                log::warn!("Incorrect queue_item with exclusive flag, empty process_id, id: {:?}", caller_process_id);
+                                return Ok(QueueRetrieveResponse::NotFound { pending, active })
+                            }
+                            (Some(item_process_id), Some(caller_id)) => if item_process_id == caller_id {
+                                // OK
+                            } else {
+                                return Ok(QueueRetrieveResponse::ExclusiveAccessFailed {
+                                    pending,
+                                    active,
+                                })
+                            },
+                            (None, None) => {}
+                        }
+                    }
+
+                    let mut new = id_row.get_row().clone();
+                    new.status = QueueItemStatus::Active;
+                    new.update_heartbeat();
+
+                    let queue_payload_schema = QueueItemPayloadRocksTable::new(db_ref.clone());
+
+                    let res =
+                        queue_schema.update(id_row.get_id(), new, id_row.get_row(), batch_pipe)?;
+                    let payload = if let Some(r) = queue_payload_schema.get_row(res.get_id())? {
+                        r.into_row().value
+                    } else {
+                        error!(
+                            "Unable to find payload for queue item, id = {}",
+                            res.get_id()
+                        );
+                        queue_schema.delete_row(res, batch_pipe)?;
+                        return Ok(QueueRetrieveResponse::NotFound { pending, active });
+                    };
+
+                    active.push(res.get_row().get_key().clone());
+                    pending -= 1;
+                    Ok(QueueRetrieveResponse::Success {
+                        id: id_row.get_id(),
+                        payload,
+                        item: res.into_row(),
+                        pending,
+                        active,
+                    })
+                } else {
+                    Ok(QueueRetrieveResponse::LockFailed { pending, active })
+                }
+            })
+            .await?;
+
+        // Update atomic counter based on result
+        match &result {
+            QueueRetrieveResponse::Success { .. } => {
+                // Increment counter (item became active)
+                let _ = self
+                    .queue_active_counters
+                    .try_increment(&prefix_for_decrement, u32::MAX)
+                    .await;
             }
-        })
-        .await
+            _ => {}
+        }
+
+        Ok(result)
     }
 
     async fn queue_ack(&self, key: QueueKey, result: Option<String>) -> Result<bool, CubeError> {
-        self.write_operation_queue("queue_ack", move |db_ref, batch_pipe| {
+        let routing_key = key.to_routing_key();
+        let counters = self.queue_active_counters.clone();
+        let ack_result = self.write_operation_queue_sharded("queue_ack", &routing_key, move |db_ref, batch_pipe| {
             let queue_item_tbl = QueueItemRocksTable::new(db_ref.clone());
             let queue_item_payload_tbl = QueueItemPayloadRocksTable::new(db_ref.clone());
 
             let item_row = queue_item_tbl.get_row_by_key(key.clone())?;
             if let Some(item_row) = item_row {
                 let path = item_row.get_row().get_path();
+                let prefix = item_row.get_row().get_prefix().clone().unwrap_or_default();
+                let was_active = item_row.get_row().get_status() == &QueueItemStatus::Active;
                 let id = item_row.get_id();
                 let external_id = item_row.get_row().get_external_id().clone();
 
@@ -1515,7 +1763,6 @@ impl CacheStore for RocksCacheStore {
                 if let Some(result) = result {
                     let queue_result = QueueResult::new(path.clone(), result, external_id);
                     let result_schema = QueueResultRocksTable::new(db_ref.clone());
-                    // QueueResult is a result of QueueItem, it's why we can use row_id of QueueItem
                     let result_row = result_schema.insert_with_pk(id, queue_result, batch_pipe)?;
 
                     batch_pipe.add_event(MetaStoreEvent::AckQueueItem(QueueResultAckEvent {
@@ -1533,14 +1780,21 @@ impl CacheStore for RocksCacheStore {
                     }));
                 }
 
-                Ok(true)
+                Ok((true, was_active, prefix))
             } else {
                 warn!("Unable to ack queue, unknown key: {:?}", key);
 
-                Ok(false)
+                Ok((false, false, String::new()))
             }
         })
-        .await
+        .await?;
+
+        // Decrement active counter if the item was active
+        if ack_result.1 {
+            counters.decrement(&ack_result.2).await;
+        }
+
+        Ok(ack_result.0)
     }
 
     async fn queue_result(

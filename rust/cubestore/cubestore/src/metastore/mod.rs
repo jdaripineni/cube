@@ -9,6 +9,7 @@ mod rocks_fs;
 mod rocks_store;
 mod rocks_table;
 pub mod schema;
+pub mod sharded_rw_loop;
 pub mod snapshot_info;
 pub mod source;
 pub mod table;

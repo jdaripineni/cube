@@ -4,6 +4,7 @@ mod cache_rocksstore;
 mod compaction;
 mod lazy;
 mod listener;
+pub mod queue_active_counters;
 mod queue_item;
 mod queue_item_payload;
 mod queue_result;
