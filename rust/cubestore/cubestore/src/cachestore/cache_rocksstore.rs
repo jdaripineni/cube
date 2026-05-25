@@ -317,6 +317,15 @@ impl RocksCacheStore {
     pub fn spawn_processing_loops(self: Arc<Self>) -> Vec<JoinHandle<Result<(), CubeError>>> {
         let mut loops = vec![];
 
+        // Rebuild active queue counters from RocksDB state before processing any operations.
+        let cachestore_rebuild = self.clone();
+        loops.push(cube_ext::spawn(async move {
+            if let Err(e) = cachestore_rebuild.rebuild_queue_active_counters().await {
+                log::error!("Failed to rebuild queue active counters: {}", e);
+            }
+            Ok(())
+        }));
+
         if self.store.config.upload_to_remote() {
             let upload_interval = self.store.config.cachestore_log_upload_interval();
             let cachestore = self.clone();
@@ -1533,19 +1542,23 @@ impl CacheStore for RocksCacheStore {
     }
 
     async fn queue_cancel(&self, key: QueueKey) -> Result<Option<QueueCancelResponse>, CubeError> {
-        self.write_operation_queue("queue_cancel", move |db_ref, batch_pipe| {
+        let routing_key = key.to_routing_key();
+        let counters = self.queue_active_counters.clone();
+        let cancel_result = self.write_operation_queue_sharded("queue_cancel", &routing_key, move |db_ref, batch_pipe| {
             let queue_schema = QueueItemRocksTable::new(db_ref.clone());
             let queue_payload_schema = QueueItemPayloadRocksTable::new(db_ref.clone());
 
             if let Some(id_row) = queue_schema.get_row_by_key(key)? {
                 let row_id = id_row.get_id();
+                let was_active = id_row.get_row().get_status() == &QueueItemStatus::Active;
+                let prefix = id_row.get_row().get_prefix().clone().unwrap_or_default();
                 let queue_item = queue_schema.delete_row(id_row, batch_pipe)?;
 
                 if let Some(queue_payload) = queue_payload_schema.try_delete(row_id, batch_pipe)? {
-                    Ok(Some(QueueCancelResponse {
+                    Ok(Some((QueueCancelResponse {
                         extra: queue_item.into_row().extra,
                         value: queue_payload.into_row().value,
-                    }))
+                    }, was_active, prefix)))
                 } else {
                     error!("Unable to find payload for queue item, id = {}", row_id);
 
@@ -1555,7 +1568,17 @@ impl CacheStore for RocksCacheStore {
                 Ok(None)
             }
         })
-        .await
+        .await?;
+
+        // Decrement active counter if the cancelled item was active
+        if let Some((response, was_active, prefix)) = cancel_result {
+            if was_active {
+                counters.decrement(&prefix).await;
+            }
+            Ok(Some(response))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn queue_heartbeat(&self, key: QueueKey) -> Result<(), CubeError> {
