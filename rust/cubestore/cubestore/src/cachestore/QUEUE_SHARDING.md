@@ -2,14 +2,67 @@
 
 ## Executive Summary
 
-CubeStore's pre-aggregation queue processes all operations (heartbeat, retrieve,
+CubeStore's query queue processes all operations (heartbeat, retrieve,
 ack, add, cancel) through a **single OS thread**. Under multi-pod deployments,
 this creates a linear increase in queue latency as pod count grows — manifesting
-as 10-20s delays in pre-aggregation processing.
+as 10-20s delays in query processing.
 
 This document describes a two-stage optimization strategy:
 - **Stage 1**: Sharded RW loop within a single CubeStore router (5-8x throughput)
 - **Stage 2**: Multiple independent CubeStore routers with prefix-based partitioning (linear horizontal scale)
+
+---
+
+## Key Terminology
+
+### WAL (Write-Ahead Log)
+
+RocksDB (the embedded key-value store CubeStore uses) persists every write
+through a **Write-Ahead Log** before applying it to the in-memory data structure.
+
+```
+  Application                    RocksDB internals
+  ───────────                    ─────────────────
+
+  db.write(batch)  ─────────►  ┌──────────────────────────────┐
+                               │         WAL File             │
+                               │                              │
+                               │  Sequential append-only log  │
+                               │  of all write operations.    │
+                               │                              │
+                               │  Purpose:                    │
+                               │  • Crash recovery (replay)   │
+                               │  • Durability guarantee      │
+                               │  • Atomicity of WriteBatch   │
+                               │                              │
+                               │  Constraint:                 │
+                               │  • Single file per DB        │
+                               │  • Writes are SERIALIZED     │
+                               │    (one writer at a time)    │
+                               │  • Protected by internal     │
+                               │    mutex                     │
+                               └──────────────┬───────────────┘
+                                              │
+                                              ▼
+                               ┌──────────────────────────────┐
+                               │       MemTable               │
+                               │  (in-memory sorted map)      │
+                               │                              │
+                               │  After WAL write succeeds,   │
+                               │  data is applied here for    │
+                               │  fast reads.                 │
+                               └──────────────────────────────┘
+```
+
+**Why this matters for sharding**: Even with N parallel shard threads preparing
+WriteBatches concurrently, the final `db.write(batch)` call serializes at the
+WAL mutex. This is why Stage 1 has a ceiling (~12-16 shards) — beyond that point,
+threads spend more time waiting for the WAL mutex than doing useful work.
+
+The WAL write is extremely fast (microseconds for small batches) because it's a
+sequential append, not a random I/O seek. This is why 8 shards still achieve ~8x
+improvement — the WAL serialization overhead is negligible relative to the total
+operation time (read + validate + build batch + notify).
 
 ---
 
@@ -523,7 +576,7 @@ Option C: Kubernetes Service + topology (simplest)
                                         │
                                         │ waits + scans active items (O(n))
                                         ▼
-  5. (executes pre-agg)
+  5. (executes query)
 
   6. ack(result)  ──────────────►  [queue: pos 8]
                                         │
@@ -551,7 +604,7 @@ Option C: Kubernetes Service + topology (simplest)
                                         │
                                         │ counter < limit → allow
                                         ▼
-  5. (executes pre-agg)
+  5. (executes query)
 
   6. ack(result)  ──────────────►  [shard 3: pos 0]
                                         │
@@ -625,7 +678,7 @@ Option C: Kubernetes Service + topology (simplest)
 | Prefix isolation | All items for a prefix on one instance | Consistent hash routing |
 | No split-brain | Routing is deterministic | Hash function is pure |
 | Result delivery | Results always on same instance as item | Prefix routing ensures co-location |
-| Failover | Instance loss = prefix unavailable until restart | Acceptable for pre-agg queue (retries) |
+| Failover | Instance loss = prefix unavailable until restart | Acceptable for query queue (retries) |
 
 ### No Dirty Reads
 
@@ -828,4 +881,124 @@ corrupting the state of item B. This is structurally impossible:
   │ queue_result         │ Read-only     │ Direct read (snapshot)         │
   │ queue_result_blocking│ Read (poll)   │ Direct read (snapshot)         │
   └──────────────────────┴───────────────┴────────────────────────────────┘
+```
+
+---
+
+## Appendix: How Pods Discover Unpicked Queries
+
+A common question: if heartbeats for different items run in parallel across
+shards, how does a pod know which queries haven't been picked up yet?
+
+**Answer**: Heartbeats have nothing to do with query discovery. They are separate
+concerns:
+
+```
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                    QUEUE OPERATION RESPONSIBILITIES                      │
+  ├──────────────────────┬──────────────────────────────────────────────────┤
+  │                      │                                                  │
+  │  queue_add           │  Pod submits a new query to the queue.           │
+  │                      │  Creates item with status=Pending.               │
+  │                      │                                                  │
+  │  queue_retrieve      │  Pod asks: "give me a pending item to execute."  │
+  │  (WITH PREFIX LOCK)  │  Finds Pending item → marks Active → returns it. │
+  │                      │  THIS is how pods discover unpicked queries.     │
+  │                      │                                                  │
+  │  queue_heartbeat     │  Pod says: "I'm still working on item X."        │
+  │                      │  Updates the heartbeat timestamp so the item     │
+  │                      │  isn't considered orphaned/timed-out.            │
+  │                      │  Has NO role in discovery.                       │
+  │                      │                                                  │
+  │  queue_ack           │  Pod says: "I finished item X, here's the result."│
+  │                      │  Marks item as Completed with result payload.    │
+  │                      │                                                  │
+  │  queue_cancel        │  Pod (or timeout) says: "abandon item X."        │
+  │                      │  Removes item from active processing.            │
+  │                      │                                                  │
+  │  queue_list / get    │  Any pod can read the full queue state at any    │
+  │  (DIRECT READS)      │  time via a RocksDB snapshot. This is used for   │
+  │                      │  monitoring, not for execution coordination.     │
+  │                      │                                                  │
+  └──────────────────────┴──────────────────────────────────────────────────┘
+```
+
+### The Coordination Model
+
+```
+  Pod A                          CubeStore                         Pod B
+  ─────                          ─────────                         ─────
+
+  1. queue_add(query-123)
+     status=Pending  ──────────► [stored in RocksDB]
+
+                                                          2. queue_retrieve(prefix, limit=3)
+                                                             │
+                                                             ├─ acquire prefix lock
+                                                             ├─ check counter: active < limit?
+                                                             ├─ find Pending items
+                                                             ├─ mark query-123 as Active
+                                                             ├─ increment counter
+                                                             ├─ release prefix lock
+                                                             │
+                                                             ◄── returns query-123 to Pod B
+
+                                                          3. Pod B executes query-123
+                                                             queue_heartbeat(query-123) every N sec
+                                                             (keeps item alive, prevents timeout)
+
+                                                          4. queue_ack(query-123, result)
+                                                             status=Completed
+
+  5. Pod A polls for result:
+     queue_result_blocking(query-123)
+     ◄───────────────────────────────── returns result
+```
+
+### Why Parallel Operations on Different Items Are Safe
+
+The safety of parallelism applies to ALL operation types, not just heartbeats:
+
+```
+  Shard 2                            Shard 5
+  (item-X ops)                       (item-Y ops)
+  ──────────────────────────────     ──────────────────────────────
+  • HEARTBEAT item-X                 • ACK item-Y (with result)
+  • ACK item-X                       • HEARTBEAT item-Y
+  • CANCEL item-X                    • ADD item-Z (new query)
+
+  Every operation on item-X:         Every operation on item-Y:
+  • Reads ONLY item-X keys           • Reads ONLY item-Y keys
+  • Writes ONLY item-X keys          • Writes ONLY item-Y keys
+  • Modifies ONLY item-X state       • Modifies ONLY item-Y state
+
+  The fundamental invariant:
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ An operation on item A NEVER reads or writes any key belonging  │
+  │ to item B. Therefore, executing A-ops and B-ops in parallel     │
+  │ produces the EXACT same result as executing them sequentially.  │
+  │                                                                 │
+  │ This holds for heartbeat, ack, cancel, add — ALL write ops.    │
+  └─────────────────────────────────────────────────────────────────┘
+
+  The ONLY cross-item shared state is the per-prefix active counter,
+  which uses lock-free atomic CAS — safe for concurrent access by design.
+```
+
+### What About Orphan Detection?
+
+If a pod crashes without acking, its items' heartbeats stop. Another mechanism
+(outside the hot path) periodically scans for items whose heartbeat is stale:
+
+```
+  Orphan detection (background, infrequent):
+
+  1. queue_list (direct read) → get all Active items
+  2. For each: if now() - heartbeat_ts > timeout → queue_cancel(item)
+  3. Item returns to Pending (or is removed), counter decremented
+
+  This scan is:
+  • Infrequent (every 30-60s, not on the hot path)
+  • A direct read (doesn't go through RW shards)
+  • Safe to run concurrently with heartbeats (snapshot isolation)
 ```
