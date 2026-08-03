@@ -833,6 +833,62 @@ corrupting the state of item B. This is structurally impossible:
 
 ---
 
+## Test Coverage
+
+The original Stage 1 implementation shipped with unit tests for `queue_add` validation
+behavior, but **zero concurrency/thread-safety tests** for the sharded RW loop itself --
+i.e. nothing that would actually fail if the guarantees in "Correctness Guarantees" / "No
+Dirty Reads" / "No Side Effects Across Items" above were violated. The following tests close
+that gap. They live in the existing `#[cfg(test)] mod tests` block in `cache_rocksstore.rs`
+(grep for `test_queue_`).
+
+They exercise the sharded path with shard counts > 1 via a new test-only constructor,
+`RocksCacheStore::prepare_test_cachestore_with_queue_workers(name, config, num_queue_workers)`,
+which pins an explicit shard count directly (bypassing `RocksCacheStore::new_from_store`'s env
+var read) instead of mutating the process-global `CUBESTORE_QUEUE_RW_WORKERS` env var. Setting
+that env var directly from a test would be unsafe: `cargo test` runs many `#[tokio::test]`
+functions in this binary concurrently across OS threads, and other tests construct their own
+cachestores (reading that same env var) at arbitrary times, so a shared mutable env var would
+race across unrelated tests. All new tests use
+`#[tokio::test(flavor = "multi_thread", worker_threads = 8)]` so spawned pod tasks get real
+parallelism.
+
+| Test | Correctness claim it backs | What it does |
+| --- | --- | --- |
+| `test_queue_retrieve_concurrency_limit_never_exceeded` | "Concurrency limit" row (per-prefix active count never exceeds `allow_concurrency`) -- the core "phantom read" risk | 8 shards, 30 distinct pending items under one prefix, `allow_concurrency=3`, all RETRIEVE concurrently; asserts `active.len()` from *every* returned response (not just a final count) never exceeds 3, and exactly 3 succeed |
+| `test_queue_same_key_race_no_lost_updates` | "Per-item ordering" row + "No Dirty Reads" §1 (same routing key -> same shard -> FIFO) | 20 rounds; each round races 10 concurrent heartbeats against one ack and one cancel, all on the SAME item key; asserts exactly one of ack/cancel wins (never both, never neither), no panics, and the item is fully gone afterward |
+| `test_queue_cross_item_isolation` | "No Side Effects Across Items" section | 25 items under 25 distinct prefixes (landing on varied shards), each concurrently heartbeated 5x then acked with a unique result string; verifies every item's stored ack result matches only its own task's write, never another item's |
+| `test_queue_counters_match_ground_truth_after_churn` | "Crash recovery: counters rebuilt from RocksDB" row + the general no-drift claim for `QueueActiveCounters` | 4 prefixes x 10 items, concurrent add/retrieve/ack/cancel churn; compares the incrementally-maintained atomic counter (both before *and* after calling `rebuild_queue_active_counters()`) against an independent RocksDB scan (`queue_list` with an Active filter) -- must match exactly in both cases |
+| `test_queue_workers_1_vs_8_equivalence` | "Backward compat" row (`workers=1` == upstream single-thread behavior) | Runs the same deterministic (sequential, not concurrent) add/heartbeat/retrieve/ack/cancel sequence once against a workers=1 store and once against a workers=8 store; asserts identical outcomes at every step |
+
+### Verified "has teeth"
+
+A test suite that never fails isn't proof of anything by itself. Per this task's own
+requirement, `test_queue_retrieve_concurrency_limit_never_exceeded` was validated by
+temporarily reintroducing the exact bug it exists to catch: commenting out
+`let _guard = retrieve_lock.lock().await;` in `queue_retrieve_by_path`
+(`cache_rocksstore.rs`), i.e. removing the per-prefix mutex that "No Dirty Reads" §1 relies
+on to prevent concurrent RETRIEVEs (routed to *different* shards, since routing is by item
+path) from racing past the ground-truth check on stale reads.
+
+With the guard removed and run 5 times back to back:
+
+```
+run 1: FAILED -- active items exceeded allow_concurrency: saw 10 active, limit was 3
+run 2: ok
+run 3: FAILED -- active items exceeded allow_concurrency: saw 10 active, limit was 3
+run 4: FAILED -- active items exceeded allow_concurrency: saw 10 active, limit was 3
+run 5: FAILED -- active items exceeded allow_concurrency: saw 9 active, limit was 3
+```
+
+4 of 5 runs caught the violation outright (the 5th is not a false negative in the test logic --
+it's the race window sometimes not being hit, which is expected for a genuine race; the fact
+that violations of 9-10 active items against a limit of 3 showed up at all is the point). With
+the guard restored, the same test passed 5/5 consecutive runs. This is the concrete evidence
+that the test would catch a real regression of this bug, not just that it passes today.
+
+---
+
 ## Monitoring
 
 ### Stage 1 Metrics to Watch
@@ -865,13 +921,171 @@ corrupting the state of item B. This is structurally impossible:
 
 ---
 
+## Benchmark Results
+
+**Environment caveat**: these numbers come from a single local laptop, not a k8s cluster:
+Apple M4 Max, 14 logical cores (`sysctl -n hw.ncpu`), 36 GB RAM, RocksDB on local SSD, single
+CubeStore process, macOS/arm64, release build. There is no network hop, no real multi-pod
+contention, and no other tenants competing for the same cores. Treat these as *indicative of
+direction and rough magnitude*, not an SLA, and not a substitute for a real staging/k8s
+measurement before rolling `CUBESTORE_QUEUE_RW_WORKERS` out widely. The earlier ASCII charts
+in this document (e.g. "8x improvement", "~2,000 ops/sec") are the original illustrative
+design-time estimates; the numbers below are what was actually measured against this branch's
+code, using the benchmark in `benches/cachestore_queue_concurrent.rs` (see "Repeatable
+Benchmark Process" below for exact commands).
+
+### What's benchmarked
+
+`benches/cachestore_queue_concurrent.rs` spawns `BENCH_PODS` concurrent async tasks ("pods"),
+each looping `BENCH_ITERS_PER_POD` times through the real lifecycle: `queue_add` ->
+`queue_retrieve_by_path` -> `queue_heartbeat` (x `BENCH_HEARTBEATS_PER_ITEM`) -> `queue_ack`.
+It measures aggregate throughput (total ops / wall-clock) and per-operation-type p50/p90/p99
+latency. Both runs below use 100 pods x 20 iterations x 3 heartbeats/item = 12,000 total ops,
+release build (`--release`; a debug build would not be representative of real op costs).
+
+Two scenarios were measured, because they tell materially different stories:
+
+- **Scenario A -- one shared queue** (`BENCH_PREFIXES=1`, the default): all 100 pods contend
+  for the same queue prefix, matching this document's earlier "single shared queue" diagrams.
+- **Scenario B -- multi-tenant** (`BENCH_PREFIXES=100`): each pod has its own queue prefix, a
+  more realistic model of independent tenants/customers each with their own query queue.
+
+### Scenario A: one shared queue prefix (worst case for RETRIEVE)
+
+| Shards (`CUBESTORE_QUEUE_RW_WORKERS`) | ops/sec | retrieve p50 / p99 (ms) | heartbeat p50 / p99 (ms) | ack p50 / p99 (ms) |
+| --- | --- | --- | --- | --- |
+| 1 (before)  | 15,638 | 33.86 / 67.01 | 0.225 / 0.710 | 0.345 / 0.762 |
+| 4           | 17,596 | 30.32 / 74.53 | 0.030 / 0.492 | 0.029 / 0.355 |
+| 8 (after)   | 17,583 | 30.14 / 76.70 | 0.028 / 0.445 | 0.028 / 0.126 |
+| 16          | 17,471 | 31.70 / 72.25 | 0.027 / 0.354 | 0.028 / 0.116 |
+
+- **Aggregate throughput speedup, workers=8 vs workers=1: 1.12x** (17,583 / 15,638) -- modest,
+  and this is a real, structural result, not measurement noise (see below for why).
+- **Per-op latency speedup, workers=8 vs workers=1: heartbeat p50 8.0x faster (0.225ms ->
+  0.028ms), ack p50 12.3x faster (0.345ms -> 0.028ms).**
+- **retrieve latency barely changes with shard count (~30-34ms p50 at every shard count).**
+  This is expected, not a bug: `queue_retrieve_by_path` acquires a **per-prefix** `tokio::Mutex`
+  (`retrieve_lock`) that serializes the entire read-check-write decision for RETRIEVE *within
+  one prefix*, by design (see "No Dirty Reads" above) -- that lock is orthogonal to
+  `CUBESTORE_QUEUE_RW_WORKERS`. With 100 pods hammering a single shared prefix, RETRIEVE
+  throughput for that prefix has a hard ceiling independent of shard count, and since RETRIEVE
+  is the slowest op in the loop, it dominates wall-clock time and caps the *aggregate*
+  ops/sec improvement even though heartbeat/ack (which back the bulk of production hot-path
+  traffic -- see "Appendix: How Pods Discover Unpicked Queries") speed up by an order of
+  magnitude underneath it.
+
+### Scenario B: multi-tenant, one prefix per pod (independent queues)
+
+| Shards (`CUBESTORE_QUEUE_RW_WORKERS`) | ops/sec | retrieve p50 / p99 (ms) | heartbeat p50 / p99 (ms) | ack p50 / p99 (ms) | add p50 / p99 (ms) |
+| --- | --- | --- | --- | --- | --- |
+| 1 (before)  | 48,293 | 2.255 / 14.82 | 2.152 / 10.71 | 2.264 / 15.03 | 0.055 / 3.842 |
+| 4           | 60,728 | 0.108 / 0.739 | 0.109 / 0.640 | 0.115 / 0.625 | 6.589 / 35.37 |
+| 8 (after)   | 71,291 | 0.078 / 0.195 | 0.068 / 0.212 | 0.073 / 0.204 | 7.824 / 9.850 |
+| 16          | 81,598 | 0.070 / 0.137 | 0.058 / 0.151 | 0.062 / 0.150 | 6.903 / 7.619 |
+
+- **Aggregate throughput speedup, workers=8 vs workers=1: 1.48x** (71,291 / 48,293); **workers=16
+  vs workers=1: 1.69x** (81,598 / 48,293).
+- **retrieve/heartbeat/ack p50 latency speedup, workers=8 vs workers=1: ~29-32x** (e.g. ack:
+  2.264ms -> 0.073ms). With independent prefixes, RETRIEVE's per-prefix lock no longer
+  serializes *across* pods (each pod's prefix has its own lock), so the sharded write path's
+  parallelism shows through directly here -- this is closer to what the original design-time
+  "8x" estimate was gesturing at, for the ops that are actually sharded.
+- **Diminishing returns above ~8 shards** are visible here too (71,291 @ 8 shards -> 81,598 @
+  16 shards is a further 1.14x, not another 2x), consistent with the document's qualitative
+  "WAL serialization ceiling" story, even though the exact shard count where it bites differs
+  from the illustrative chart (expected -- this is 14 cores, not the chart's hypothetical
+  fleet).
+
+### Surprise finding: `queue_add` is not sharded, and it shows
+
+`queue_add` goes through the original single-thread `write_operation_queue` path, not
+`write_operation_queue_sharded` (confirmed directly in `cache_rocksstore.rs` -- see "Appendix:
+Operation Classification" below, which is corrected accordingly). In Scenario B, `add` p50
+latency gets **worse** as shard count increases: 0.055ms at workers=1, up to 6.6-7.8ms at
+workers=4/8/16. This is not noise -- it reproduced consistently across repeated runs. The
+mechanism: once RETRIEVE/heartbeat/ACK are fast (sharded), each pod loops through its 20
+iterations much faster and comes back around to its next `queue_add` call sooner, so all 100
+pods pile onto the *one* remaining single-threaded queue (`rw_loop_queue_cf`) far more
+densely than they did when the rest of the loop was slow enough to naturally space `add` calls
+out. Relieving contention downstream exposes contention upstream. This means `queue_add` is a
+reasonable candidate for a future "Stage 1.5" (shard it too, keyed by item path like the other
+write ops) if `add` throughput becomes a bottleneck in practice -- worth flagging since it
+wasn't obvious from reading the design doc alone, only from actually running a workload shaped
+like production traffic.
+
+---
+
+## Repeatable Benchmark Process
+
+1. **Build in release mode** (required -- debug-mode timings are not representative):
+   ```sh
+   cd rust/cubestore
+   cargo build -p cubestore --release --bench cachestore_queue_concurrent
+   ```
+   Find the resulting binary once (its hash suffix is stable across incremental rebuilds
+   unless dependencies change):
+   ```sh
+   find target/release/deps -maxdepth 1 -iname 'cachestore_queue_concurrent-*' -perm -u+x -type f
+   ```
+
+2. **Run "before" (workers=1) and "after" (workers=8, or whatever you're validating)** for
+   each scenario you care about. Always `rm -rf` the previous run's DB dir first (the binary
+   reuses `cubestore/db-tmp/benchmarks/cachestore_queue_concurrent_bench_w<N>/` per shard
+   count and does not truncate it automatically):
+   ```sh
+   cd cubestore
+   BIN=../target/release/deps/cachestore_queue_concurrent-<hash>
+
+   # Scenario A: one shared queue (default BENCH_PREFIXES=1)
+   rm -rf db-tmp/benchmarks/cachestore_queue_concurrent_bench_w1
+   CUBESTORE_QUEUE_RW_WORKERS=1 BENCH_PODS=100 BENCH_ITERS_PER_POD=20 BENCH_HEARTBEATS_PER_ITEM=3 "$BIN"
+
+   rm -rf db-tmp/benchmarks/cachestore_queue_concurrent_bench_w8
+   CUBESTORE_QUEUE_RW_WORKERS=8 BENCH_PODS=100 BENCH_ITERS_PER_POD=20 BENCH_HEARTBEATS_PER_ITEM=3 "$BIN"
+
+   # Scenario B: multi-tenant, one prefix per pod
+   rm -rf db-tmp/benchmarks/cachestore_queue_concurrent_bench_w1
+   CUBESTORE_QUEUE_RW_WORKERS=1 BENCH_PODS=100 BENCH_ITERS_PER_POD=20 BENCH_HEARTBEATS_PER_ITEM=3 BENCH_PREFIXES=100 "$BIN"
+
+   rm -rf db-tmp/benchmarks/cachestore_queue_concurrent_bench_w8
+   CUBESTORE_QUEUE_RW_WORKERS=8 BENCH_PODS=100 BENCH_ITERS_PER_POD=20 BENCH_HEARTBEATS_PER_ITEM=3 BENCH_PREFIXES=100 "$BIN"
+   ```
+   All `BENCH_*` env vars are optional; see the doc comment at the top of
+   `cachestore_queue_concurrent.rs` for the full list and defaults. Shard counts tested for
+   this baseline: 1, 4, 8, 16.
+
+3. **How to read the output**: the tool prints, per run, `aggregate throughput: N ops/sec`
+   (total ops / wall-clock across all concurrent pods) and a table of p50/p90/p99/max latency
+   per operation type (`add`/`retrieve`/`heartbeat`/`ack`), plus an "overall" row combining all
+   op types. Compare like-for-like: same `BENCH_PODS`/`BENCH_ITERS_PER_POD`/`BENCH_PREFIXES`
+   across the workers values you're comparing, since those parameters materially change both
+   the absolute numbers and which op dominates wall-clock time (see Scenario A vs B above).
+
+4. **Comparing a future run against this baseline**: re-run the exact commands above (same
+   `BENCH_*` values) and diff the "ops/sec" and per-op p50/p99 lines against the tables in
+   this section. A regression looks like: aggregate ops/sec dropping at a fixed shard count,
+   or a previously-sharded op's (heartbeat/ack/retrieve/cancel) p50 latency drifting back
+   toward its workers=1 value even at higher shard counts (that would suggest the sharding
+   itself broke, e.g. shards silently collapsing to 1, or a new lock serializing what used to
+   be parallel). Re-run 2-3 times before concluding a change is real -- these are wall-clock
+   timings on a shared laptop and will have some run-to-run variance (the numbers above showed
+   +/-10% or so across repeated runs at the same configuration).
+
+5. Do **not** compare debug-build numbers to this baseline, and do not compare runs with
+   different `BENCH_PODS`/`BENCH_ITERS_PER_POD`/`BENCH_PREFIXES` to each other directly --
+   normalize on ops/sec and latency percentiles, not raw wall-clock time, if you change the
+   op count.
+
+---
+
 ## Appendix: Operation Classification
 
 ```
   ┌──────────────────────┬───────────────┬────────────────────────────────┐
   │ Operation            │ Type          │ Routing Strategy               │
   ├──────────────────────┼───────────────┼────────────────────────────────┤
-  │ queue_add            │ Write         │ Sharded by item path           │
+  │ queue_add            │ Write         │ NOT sharded -- single RW loop  │
+  │                      │               │ (see note below)               │
   │ queue_heartbeat      │ Write         │ Sharded by item key            │
   │ queue_retrieve       │ Read + Write  │ Per-prefix lock + shard write  │
   │ queue_ack            │ Write         │ Sharded by item key            │
@@ -882,6 +1096,13 @@ corrupting the state of item B. This is structurally impossible:
   │ queue_result_blocking│ Read (poll)   │ Direct read (snapshot)         │
   └──────────────────────┴───────────────┴────────────────────────────────┘
 ```
+
+**Correction (found while benchmarking, see "## Benchmark Results" -> "Surprise finding")**:
+`queue_add` is implemented via the original single-thread `write_operation_queue`, not
+`write_operation_queue_sharded` -- confirmed directly in `cache_rocksstore.rs`. It does not
+shard by item path today. This table previously said otherwise; the code is the source of
+truth. This is a reasonable candidate for a future "Stage 1.5" if `add` throughput becomes a
+bottleneck in practice.
 
 ---
 

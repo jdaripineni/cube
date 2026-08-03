@@ -12,3 +12,14 @@ members = [
 
 [profile.bench]
 debug = true
+
+[patch.crates-io]
+# Upstream rdkafka-sys 4.8.0+2.3.0 bundles librdkafka's CRC32C hardware path
+# (x86-only SSE4.2 inline asm) unconditionally on any arch configure's compile
+# check happens to accept, which includes arm64 macOS/clang -- the check
+# compiles in isolation but the real build then fails. See
+# vendor-patches/rdkafka-sys-4.8.0+2.3.0/librdkafka/src/crc32c.c for the fix
+# (guards the hardware path behind an x86 arch check, matching the file's own
+# "FIXME: Hardware support on ARM" note). Safe to drop once upstream ships a
+# release with an equivalent guard.
+rdkafka-sys = { path = "vendor-patches/rdkafka-sys-4.8.0+2.3.0" }

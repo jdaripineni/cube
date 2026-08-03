@@ -953,6 +953,10 @@ impl RocksStore {
         Ok(meta_store)
     }
 
+    pub fn get_name(&self) -> &'static str {
+        self.details.get_name()
+    }
+
     pub fn new(
         path: &Path,
         metastore_fs: Arc<dyn MetaStoreFs>,

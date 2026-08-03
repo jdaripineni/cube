@@ -119,7 +119,9 @@ sasl2-sys = { version = "0.1.6", features = ["vendored"] }
 rdkafka = { version = "0.29.0", features = ["cmake-build"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-rdkafka = { version = "0.29.0", features = ["ssl", "gssapi"] }
+# ssl-vendored (not ssl) avoids linking against a mismatched-architecture system OpenSSL
+# (e.g. an Intel Homebrew install on Apple Silicon) by building OpenSSL from source instead.
+rdkafka = { version = "0.29.0", features = ["ssl-vendored", "gssapi"] }
 sasl2-sys = { version = "0.1.6", features = ["vendored"] }
 
 [dev-dependencies]
@@ -130,6 +132,10 @@ insta = "1.34"
 
 [[bench]]
 name = "cachestore_queue"
+harness = false
+
+[[bench]]
+name = "cachestore_queue_concurrent"
 harness = false
 
 [[bench]]

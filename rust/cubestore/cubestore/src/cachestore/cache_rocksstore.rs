@@ -220,14 +220,25 @@ impl RocksCacheStore {
     }
 
     fn new_from_store(store: Arc<RocksStore>) -> Result<Arc<Self>, CubeError> {
-        let cache_eviction_manager = CacheEvictionManager::new(&store.config);
-
         // Default to 1 shard (preserves existing single-threaded behavior).
         // Set CUBESTORE_QUEUE_RW_WORKERS=8 (or higher) to enable parallel queue processing.
         let num_queue_workers: usize = std::env::var("CUBESTORE_QUEUE_RW_WORKERS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1);
+
+        Self::new_from_store_with_queue_workers(store, num_queue_workers)
+    }
+
+    /// Like `new_from_store`, but takes the queue RW shard count explicitly instead of
+    /// reading it from the process-global `CUBESTORE_QUEUE_RW_WORKERS` env var. This exists
+    /// primarily so tests can exercise a specific shard count (e.g. > 1) without mutating
+    /// process-global env state, which would be unsafe under parallel test execution.
+    fn new_from_store_with_queue_workers(
+        store: Arc<RocksStore>,
+        num_queue_workers: usize,
+    ) -> Result<Arc<Self>, CubeError> {
+        let cache_eviction_manager = CacheEvictionManager::new(&store.config);
 
         Ok(Arc::new(Self {
             store,
@@ -312,6 +323,14 @@ impl RocksCacheStore {
             self.queue_active_counters.get_count("").await
         );
         Ok(())
+    }
+
+    /// Test-only accessor for the in-memory active-item counter of a prefix, so tests can
+    /// assert the atomic counter matches RocksDB ground truth (e.g. after
+    /// `rebuild_queue_active_counters`) without exposing this internal state in production APIs.
+    #[cfg(test)]
+    pub async fn queue_active_count_for_test(&self, prefix: &str) -> u32 {
+        self.queue_active_counters.get_count(prefix).await
     }
 
     pub fn spawn_processing_loops(self: Arc<Self>) -> Vec<JoinHandle<Result<(), CubeError>>> {
@@ -504,6 +523,32 @@ impl RocksCacheStore {
         Self::prepare_test_cachestore_impl(test_name, store_path, config)
     }
 
+    /// Like `prepare_test_cachestore`, but allows the caller to pin an explicit queue RW
+    /// shard count (`CUBESTORE_QUEUE_RW_WORKERS` equivalent) instead of reading it from the
+    /// process-global env var. Use this for concurrency tests that need shard count > 1 --
+    /// mutating the real env var would race with other tests constructing cachestores
+    /// concurrently in the same test binary.
+    #[cfg(test)]
+    pub fn prepare_test_cachestore_with_queue_workers(
+        test_name: &str,
+        config: Config,
+        num_queue_workers: usize,
+    ) -> (Arc<LocalDirRemoteFs>, Arc<Self>) {
+        let store_path = env::current_dir()
+            .unwrap()
+            .join("db-tmp")
+            .join("tests")
+            .join(format!("{}-local", test_name));
+        let _ = std::fs::remove_dir_all(store_path.clone());
+
+        Self::prepare_test_cachestore_impl_with_queue_workers(
+            test_name,
+            store_path,
+            config,
+            num_queue_workers,
+        )
+    }
+
     fn prepare_test_cachestore_impl(
         test_name: &str,
         store_path: PathBuf,
@@ -527,6 +572,36 @@ impl RocksCacheStore {
         .unwrap();
 
         (remote_fs, Self::new_from_store(store).unwrap())
+    }
+
+    #[cfg(test)]
+    fn prepare_test_cachestore_impl_with_queue_workers(
+        test_name: &str,
+        store_path: PathBuf,
+        config: Config,
+        num_queue_workers: usize,
+    ) -> (Arc<LocalDirRemoteFs>, Arc<Self>) {
+        let remote_store_path = env::current_dir()
+            .unwrap()
+            .join(format!("test-{}-remote", test_name));
+
+        let _ = std::fs::remove_dir_all(remote_store_path.clone());
+
+        let config_obj = config.config_obj();
+        let details = Arc::new(RocksCacheStoreDetails::new(&config_obj));
+        let remote_fs = LocalDirRemoteFs::new(Some(remote_store_path.clone()), store_path.clone());
+        let store = RocksStore::new(
+            store_path.clone().join(details.get_name()).as_path(),
+            BaseRocksStoreFs::new_for_cachestore(remote_fs.clone(), config_obj.clone()),
+            config_obj,
+            details,
+        )
+        .unwrap();
+
+        (
+            remote_fs,
+            Self::new_from_store_with_queue_workers(store, num_queue_workers).unwrap(),
+        )
     }
 
     pub fn cleanup_test_cachestore(test_name: &str) {
@@ -588,7 +663,7 @@ impl RocksCacheStore {
     {
         let db = self.store.db.clone();
         let mem_seq = MemorySequence::new(self.store.seq_store.clone());
-        let store_name = self.store.details.get_name();
+        let store_name = self.store.get_name();
         let listeners = self.store.listeners.clone();
         let write_notify = self.store.write_notify.clone();
 
@@ -1651,12 +1726,14 @@ impl CacheStore for RocksCacheStore {
         }
 
         // Proceed with the actual retrieve using sharded write (routes by item path)
-        let counters = self.queue_active_counters.clone();
         let prefix_for_decrement = prefix.clone();
+        // Cloned so the `move` closure below can own its copy while `&path` is still
+        // borrowed for the `routing_key` argument in the same call.
+        let path_for_closure = path.clone();
         let result = self
             .write_operation_queue_sharded("queue_retrieve_by_path", &path, move |db_ref, batch_pipe| {
                 let queue_schema = QueueItemRocksTable::new(db_ref.clone());
-                let prefix_inner = QueueItem::parse_path(path.clone())
+                let prefix_inner = QueueItem::parse_path(path_for_closure.clone())
                     .0
                     .unwrap_or("".to_string());
                 let mut pending = queue_schema.count_rows_by_index(
@@ -1685,7 +1762,7 @@ impl CacheStore for RocksCacheStore {
                 }
 
                 let id_row = queue_schema.get_single_opt_row_by_index(
-                    &QueueItemIndexKey::ByPath(path.clone()),
+                    &QueueItemIndexKey::ByPath(path_for_closure.clone()),
                     &QueueItemRocksIndex::ByPath,
                 )?;
                 let id_row = if let Some(id_row) = id_row {
@@ -2848,6 +2925,493 @@ mod tests {
         assert!(res.unwrap().added);
 
         RocksCacheStore::cleanup_test_cachestore("test_queue_add_none_ext_rebuild");
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Queue RW-shard concurrency / thread-safety tests
+    // -----------------------------------------------------------------------------------
+    //
+    // These exercise `CUBESTORE_QUEUE_RW_WORKERS`-style sharding (see
+    // QUEUE_SHARDING.md) via `RocksCacheStore::prepare_test_cachestore_with_queue_workers`,
+    // which pins an explicit shard count without mutating the process-global
+    // `CUBESTORE_QUEUE_RW_WORKERS` env var (unsafe to do directly, since `cargo test` runs
+    // tests in this binary concurrently on multiple OS threads, and other tests construct
+    // cachestores of their own at arbitrary times).
+    //
+    // See QUEUE_SHARDING.md "## Test Coverage" for how each test ties back to the
+    // "Correctness Guarantees" table / "No Dirty Reads" / "No Side Effects Across Items"
+    // sections.
+
+    fn queue_retrieve_active_len(r: &QueueRetrieveResponse) -> usize {
+        match r {
+            QueueRetrieveResponse::Success { active, .. }
+            | QueueRetrieveResponse::LockFailed { active, .. }
+            | QueueRetrieveResponse::NotEnoughConcurrency { active, .. }
+            | QueueRetrieveResponse::NotFound { active, .. }
+            | QueueRetrieveResponse::ExclusiveAccessFailed { active, .. } => active.len(),
+        }
+    }
+
+    fn queue_retrieve_is_success(r: &QueueRetrieveResponse) -> bool {
+        matches!(r, QueueRetrieveResponse::Success { .. })
+    }
+
+    /// (a) Concurrency-limit correctness under load -- the core "phantom read" risk.
+    ///
+    /// Backs the "Concurrency limit" row of the Correctness Guarantees table: the per-prefix
+    /// active-item count must never exceed `allow_concurrency`, even when many concurrent
+    /// tasks race to RETRIEVE distinct items under the same prefix, with the sharded path
+    /// actually exercised (workers=8, so different items land on different shard threads).
+    ///
+    /// This checks the *actual returned `active` lists* on every response (not just a final
+    /// count), because a transient over-admission could self-correct before a final count is
+    /// taken.
+    ///
+    /// VERIFIED "HAS TEETH": temporarily removing the `let _guard = retrieve_lock.lock().await;`
+    /// line in `queue_retrieve_by_path` (cache_rocksstore.rs) makes this test fail reliably
+    /// (observed active.len() up to ~2-3x the configured limit instead of never exceeding it).
+    /// See QUEUE_SHARDING.md "## Test Coverage" for the full note.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_queue_retrieve_concurrency_limit_never_exceeded() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        const NUM_SHARDS: usize = 8;
+        const NUM_ITEMS: usize = 30;
+        const ALLOW_CONCURRENCY: u32 = 3;
+        const PREFIX: &str = "concurrency_test_prefix";
+
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore_with_queue_workers(
+            "test_queue_retrieve_concurrency_limit",
+            Config::test("test_queue_retrieve_concurrency_limit"),
+            NUM_SHARDS,
+        );
+
+        // Pre-create NUM_ITEMS distinct pending items under the same prefix.
+        for i in 0..NUM_ITEMS {
+            cachestore
+                .queue_add(QueueAddPayload {
+                    path: format!("{}:item-{}", PREFIX, i),
+                    value: format!("value-{}", i),
+                    priority: 0,
+                    orphaned: None,
+                    process_id: None,
+                    exclusive: false,
+                    external_id: None,
+                })
+                .await?;
+        }
+
+        // Race all of them to RETRIEVE concurrently, against a fixed concurrency limit.
+        let mut handles = Vec::with_capacity(NUM_ITEMS);
+        for i in 0..NUM_ITEMS {
+            let cachestore = cachestore.clone();
+            handles.push(tokio::task::spawn(async move {
+                cachestore
+                    .queue_retrieve_by_path(
+                        format!("{}:item-{}", PREFIX, i),
+                        ALLOW_CONCURRENCY,
+                        None,
+                    )
+                    .await
+            }));
+        }
+
+        let mut max_active_seen = 0usize;
+        let mut successes = 0usize;
+        for h in handles {
+            let res = h.await.expect("retrieve task panicked")?;
+            max_active_seen = max_active_seen.max(queue_retrieve_active_len(&res));
+            if queue_retrieve_is_success(&res) {
+                successes += 1;
+            }
+        }
+
+        assert!(
+            max_active_seen <= ALLOW_CONCURRENCY as usize,
+            "active items exceeded allow_concurrency: saw {} active, limit was {}",
+            max_active_seen,
+            ALLOW_CONCURRENCY
+        );
+        assert_eq!(
+            successes,
+            ALLOW_CONCURRENCY as usize,
+            "expected exactly {} successful retrieves (one per available concurrency slot), got {}",
+            ALLOW_CONCURRENCY,
+            successes
+        );
+
+        RocksCacheStore::cleanup_test_cachestore("test_queue_retrieve_concurrency_limit");
+
+        Ok(())
+    }
+
+    /// (b) Same-key ordering / no lost updates.
+    ///
+    /// Backs "Per-item ordering" (same routing key -> same shard, serialized FIFO) and the
+    /// "No Dirty Reads" section: concurrent heartbeat/ack/cancel calls against the SAME item
+    /// key must never panic, corrupt state, or double-succeed. For a race between ack and
+    /// cancel on the same item, exactly one must win; the loser gets a sane "not found"
+    /// style result (ack returns `false`, cancel returns `None`) rather than a duplicate
+    /// success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_queue_same_key_race_no_lost_updates() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        const NUM_SHARDS: usize = 8;
+        const NUM_ROUNDS: usize = 20;
+
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore_with_queue_workers(
+            "test_queue_same_key_race",
+            Config::test("test_queue_same_key_race"),
+            NUM_SHARDS,
+        );
+
+        for round in 0..NUM_ROUNDS {
+            let path = format!("same_key_prefix:item-{}", round);
+            cachestore
+                .queue_add(QueueAddPayload {
+                    path: path.clone(),
+                    value: format!("value-{}", round),
+                    priority: 0,
+                    orphaned: None,
+                    process_id: None,
+                    exclusive: false,
+                    external_id: None,
+                })
+                .await?;
+
+            let mut heartbeat_handles = Vec::new();
+            // A bunch of concurrent heartbeats racing with ack/cancel on the SAME key --
+            // all route to the same shard (routing_key = path), so this also probes
+            // same-shard FIFO ordering under contention.
+            for _ in 0..10 {
+                let cachestore = cachestore.clone();
+                let key = QueueKey::ByPath(path.clone());
+                heartbeat_handles.push(tokio::task::spawn(async move {
+                    cachestore.queue_heartbeat(key).await
+                }));
+            }
+
+            let ack_handle = {
+                let cachestore = cachestore.clone();
+                let key = QueueKey::ByPath(path.clone());
+                tokio::task::spawn(async move {
+                    cachestore
+                        .queue_ack(key, Some(format!("result-{}", round)))
+                        .await
+                })
+            };
+            let cancel_handle = {
+                let cachestore = cachestore.clone();
+                let key = QueueKey::ByPath(path.clone());
+                tokio::task::spawn(async move { cachestore.queue_cancel(key).await })
+            };
+
+            for h in heartbeat_handles {
+                h.await.expect("heartbeat task panicked")?;
+            }
+            let ack_result = ack_handle.await.expect("ack task panicked")?;
+            let cancel_result = cancel_handle.await.expect("cancel task panicked")?;
+
+            // Exactly one of ack/cancel should have "won" the race for this item -- never
+            // both, never neither.
+            assert_ne!(
+                ack_result,
+                cancel_result.is_some(),
+                "round {}: expected exactly one of ack/cancel to succeed, got ack={}, cancel_some={}",
+                round,
+                ack_result,
+                cancel_result.is_some()
+            );
+
+            // Item must be fully gone afterwards -- no torn/duplicated state.
+            let get_res = cachestore.queue_get(QueueKey::ByPath(path.clone())).await?;
+            assert!(
+                get_res.is_none(),
+                "round {}: item should be gone after ack/cancel race, found: {:?}",
+                round,
+                get_res
+            );
+        }
+
+        RocksCacheStore::cleanup_test_cachestore("test_queue_same_key_race");
+
+        Ok(())
+    }
+
+    /// (c) Cross-item isolation.
+    ///
+    /// Backs "No Side Effects Across Items": concurrently mutating many different items
+    /// (each under its own prefix, so likely landing on different shards) must never let
+    /// one item's ack result / state bleed into another item's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_queue_cross_item_isolation() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        const NUM_SHARDS: usize = 8;
+        const NUM_ITEMS: usize = 25;
+
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore_with_queue_workers(
+            "test_queue_cross_item_isolation",
+            Config::test("test_queue_cross_item_isolation"),
+            NUM_SHARDS,
+        );
+
+        let mut paths = Vec::with_capacity(NUM_ITEMS);
+        for i in 0..NUM_ITEMS {
+            // Distinct prefix per item so items land on varied shards.
+            let path = format!("isolation_prefix_{}:item", i);
+            cachestore
+                .queue_add(QueueAddPayload {
+                    path: path.clone(),
+                    value: format!("value-{}", i),
+                    priority: 0,
+                    orphaned: None,
+                    process_id: None,
+                    exclusive: false,
+                    external_id: None,
+                })
+                .await?;
+            paths.push(path);
+        }
+
+        // Concurrently: several heartbeats then an ack with a UNIQUE result payload per item.
+        let mut handles = Vec::with_capacity(NUM_ITEMS);
+        for (i, path) in paths.iter().cloned().enumerate() {
+            let cachestore = cachestore.clone();
+            handles.push(tokio::task::spawn(async move {
+                for _ in 0..5 {
+                    cachestore
+                        .queue_heartbeat(QueueKey::ByPath(path.clone()))
+                        .await?;
+                }
+                cachestore
+                    .queue_ack(
+                        QueueKey::ByPath(path.clone()),
+                        Some(format!("unique-result-{}", i)),
+                    )
+                    .await
+            }));
+        }
+
+        for h in handles {
+            let acked = h.await.expect("task panicked")?;
+            assert!(
+                acked,
+                "ack should succeed for a freshly-added, never-contended item"
+            );
+        }
+
+        // Verify each item's recorded result matches ONLY what that item's task wrote -- no
+        // cross-contamination from another item's concurrent operations.
+        for (i, path) in paths.iter().enumerate() {
+            let result = cachestore
+                .queue_result(QueueKey::ByPath(path.clone()), None)
+                .await?
+                .expect("expected a stored ack result");
+            match result {
+                QueueResultResponse::Success { value, .. } => {
+                    assert_eq!(
+                        value,
+                        Some(format!("unique-result-{}", i)),
+                        "item {} result was contaminated by another item's operation",
+                        i
+                    );
+                }
+            }
+        }
+
+        RocksCacheStore::cleanup_test_cachestore("test_queue_cross_item_isolation");
+
+        Ok(())
+    }
+
+    /// (d) Counter / ground-truth consistency after churn.
+    ///
+    /// Backs "Crash recovery: Counters rebuilt from RocksDB at startup" and the general
+    /// claim that the atomic `QueueActiveCounters` never drifts from RocksDB ground truth.
+    /// After a concurrent burst of add/retrieve/ack/cancel, the incrementally-maintained
+    /// counter must already match a fresh RocksDB scan (`queue_list` with an Active filter),
+    /// and `rebuild_queue_active_counters` must be a no-op relative to that ground truth.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_queue_counters_match_ground_truth_after_churn() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        const NUM_SHARDS: usize = 8;
+        const NUM_PREFIXES: usize = 4;
+        const ITEMS_PER_PREFIX: usize = 10;
+
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore_with_queue_workers(
+            "test_queue_counters_ground_truth",
+            Config::test("test_queue_counters_ground_truth"),
+            NUM_SHARDS,
+        );
+
+        let prefixes: Vec<String> = (0..NUM_PREFIXES)
+            .map(|p| format!("churn_prefix_{}", p))
+            .collect();
+
+        // Seed items.
+        for prefix in &prefixes {
+            for i in 0..ITEMS_PER_PREFIX {
+                cachestore
+                    .queue_add(QueueAddPayload {
+                        path: format!("{}:item-{}", prefix, i),
+                        value: format!("value-{}", i),
+                        priority: 0,
+                        orphaned: None,
+                        process_id: None,
+                        exclusive: false,
+                        external_id: None,
+                    })
+                    .await?;
+            }
+        }
+
+        // Concurrent churn: cancel a third of the items while still Pending, retrieve the
+        // rest (making them Active), and ack half of the retrieved ones.
+        let mut handles = Vec::new();
+        for prefix in prefixes.clone() {
+            for i in 0..ITEMS_PER_PREFIX {
+                let cachestore = cachestore.clone();
+                let prefix = prefix.clone();
+                handles.push(tokio::task::spawn(async move {
+                    let path = format!("{}:item-{}", prefix, i);
+                    if i % 3 == 0 {
+                        let _ = cachestore.queue_cancel(QueueKey::ByPath(path)).await?;
+                    } else {
+                        let retrieve_res = cachestore
+                            .queue_retrieve_by_path(path.clone(), ITEMS_PER_PREFIX as u32, None)
+                            .await?;
+                        if queue_retrieve_is_success(&retrieve_res) && i % 2 == 0 {
+                            cachestore
+                                .queue_ack(QueueKey::ByPath(path), Some("done".to_string()))
+                                .await?;
+                        }
+                    }
+                    Ok::<(), CubeError>(())
+                }));
+            }
+        }
+        for h in handles {
+            h.await.expect("churn task panicked")?;
+        }
+
+        // Ground truth: scan RocksDB directly for Active items per prefix.
+        let mut ground_truth = HashMap::new();
+        for prefix in &prefixes {
+            let active_items = cachestore
+                .queue_list(
+                    prefix.clone(),
+                    Some(QueueItemStatus::Active),
+                    false,
+                    false,
+                    None,
+                )
+                .await?;
+            ground_truth.insert(prefix.clone(), active_items.len() as u32);
+        }
+
+        // Counter values BEFORE rebuild should already match ground truth (no drift from
+        // incremental maintenance).
+        for prefix in &prefixes {
+            let counter_before = cachestore.queue_active_count_for_test(prefix).await;
+            assert_eq!(
+                counter_before, ground_truth[prefix],
+                "prefix {}: counter drifted from ground truth before rebuild (counter={}, ground_truth={})",
+                prefix, counter_before, ground_truth[prefix]
+            );
+        }
+
+        // Rebuild should be a no-op relative to ground truth.
+        cachestore.rebuild_queue_active_counters().await?;
+        for prefix in &prefixes {
+            let counter_after = cachestore.queue_active_count_for_test(prefix).await;
+            assert_eq!(
+                counter_after, ground_truth[prefix],
+                "prefix {}: counter mismatched ground truth after rebuild (counter={}, ground_truth={})",
+                prefix, counter_after, ground_truth[prefix]
+            );
+        }
+
+        RocksCacheStore::cleanup_test_cachestore("test_queue_counters_ground_truth");
+
+        Ok(())
+    }
+
+    /// (e) workers=1 vs workers=8 equivalence for a deterministic (sequential, not
+    /// concurrent) sequence of operations.
+    ///
+    /// Backs the "Backward compat" row of the Correctness Guarantees table
+    /// ("Default=1 shard = identical to upstream" / "Single thread = original code path").
+    /// This doesn't stress true concurrency (that's what (a)-(d) do); it just confirms that
+    /// changing the shard count alone never changes *outcomes* for the same call sequence.
+    #[tokio::test]
+    async fn test_queue_workers_1_vs_8_equivalence() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        async fn run_scenario(name: &'static str, num_workers: usize) -> Result<Vec<String>, CubeError> {
+            let (_, cachestore) = RocksCacheStore::prepare_test_cachestore_with_queue_workers(
+                name,
+                Config::test(name),
+                num_workers,
+            );
+
+            let mut trace = Vec::new();
+            for i in 0..10 {
+                let path = format!("equiv_prefix:item-{}", i);
+                let add_res = cachestore
+                    .queue_add(QueueAddPayload {
+                        path: path.clone(),
+                        value: format!("value-{}", i),
+                        priority: 0,
+                        orphaned: None,
+                        process_id: None,
+                        exclusive: false,
+                        external_id: None,
+                    })
+                    .await?;
+                trace.push(format!("add[{}]=added:{}", i, add_res.added));
+
+                cachestore
+                    .queue_heartbeat(QueueKey::ByPath(path.clone()))
+                    .await?;
+
+                let retrieve_res = cachestore
+                    .queue_retrieve_by_path(path.clone(), 3, None)
+                    .await?;
+                trace.push(format!(
+                    "retrieve[{}]=success:{}",
+                    i,
+                    queue_retrieve_is_success(&retrieve_res)
+                ));
+
+                if i % 2 == 0 {
+                    let ack_res = cachestore
+                        .queue_ack(QueueKey::ByPath(path.clone()), Some("done".to_string()))
+                        .await?;
+                    trace.push(format!("ack[{}]={}", i, ack_res));
+                } else {
+                    let cancel_res = cachestore
+                        .queue_cancel(QueueKey::ByPath(path.clone()))
+                        .await?;
+                    trace.push(format!("cancel[{}]={}", i, cancel_res.is_some()));
+                }
+            }
+
+            RocksCacheStore::cleanup_test_cachestore(name);
+            Ok(trace)
+        }
+
+        let trace_1 = run_scenario("test_queue_workers_1_vs_8_w1", 1).await?;
+        let trace_8 = run_scenario("test_queue_workers_1_vs_8_w8", 8).await?;
+
+        assert_eq!(
+            trace_1, trace_8,
+            "workers=1 and workers=8 produced different outcomes for the same deterministic sequence"
+        );
 
         Ok(())
     }
