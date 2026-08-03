@@ -8,8 +8,19 @@ this creates a linear increase in queue latency as pod count grows — manifesti
 as 10-20s delays in query processing.
 
 This document describes a two-stage optimization strategy:
-- **Stage 1**: Sharded RW loop within a single CubeStore router (5-8x throughput)
+- **Stage 1**: Sharded RW loop within a single CubeStore router
 - **Stage 2**: Multiple independent CubeStore routers with prefix-based partitioning (linear horizontal scale)
+
+**What Stage 1 actually delivers, measured**: the "5-8x throughput" figure above was a
+design-time estimate, not a measurement -- see "## Benchmark Results" for what was actually
+observed once Stage 1 was tested end-to-end. The short version: aggregate throughput
+improvement ranges from modest (1.1x) to solid (1.5-1.7x) depending on whether pods share one
+queue prefix or have independent ones, because RETRIEVE has its own correctness-driven
+serialization that sharding doesn't remove. The benefit that holds regardless of that
+tenancy shape is different, and arguably more important operationally: heartbeat and ack stop
+queueing behind unrelated pods' work (8-30x faster, depending on scenario). See "### Why This
+Matters: Heartbeat/Ack Latency and Orphan Detection" below for why that specifically matters,
+not just that it's faster.
 
 ---
 
@@ -613,6 +624,51 @@ Option C: Kubernetes Service + topology (simplest)
   Total time: <500ms queueing + actual computation
 ```
 
+### Why This Matters: Heartbeat/Ack Latency and Orphan Detection
+
+The "waits for 11 ops" -> "immediate (no queue)" change for heartbeat in the diagram above
+isn't just a latency number -- it removes a specific failure mode.
+
+**The mechanism, precisely**: before Stage 1, every queue operation for every item from every
+pod was pushed onto **one mpsc channel feeding one OS thread**, which drains it strictly in
+arrival order. If pod B's slow `queue_retrieve` (for item Y) happened to be enqueued just
+before pod A's `queue_heartbeat` (for item X), the heartbeat could not run until that retrieve
+finished -- even though heartbeat-for-X and retrieve-for-Y touch entirely different RocksDB
+keys and have no logical dependency on each other. The single thread has no way to know that;
+it is FIFO over everything.
+
+`ShardedRocksStoreRWLoop` fixes this by routing every operation via `schedule_keyed`, which
+hashes the **item's own key** (`QueueKey::to_routing_key()`, i.e. its path or id) mod N to pick
+one of N independent OS threads (each with its own channel). Two operations on the *same* item
+always land on the same shard, so per-item ordering is preserved. Two operations on
+*different* items usually land on *different* shards (~1-in-N chance of colliding), so pod A's
+heartbeat for item X and pod B's retrieve for item Y are very likely on separate threads
+entirely -- the heartbeat is no longer blocked by that retrieve, only by whatever else happens
+to hash to its own shard, a much smaller slice of total traffic.
+
+One nuance worth being precise about, since it also explains why RETRIEVE itself doesn't get
+faster while heartbeat/ack do: RETRIEVE has a *second, separate* serialization point -- the
+per-prefix `retrieve_lock` in `queue_retrieve_by_path`, added specifically so the
+concurrency-limit check-then-act stays correct (see "No Dirty Reads" above). That lock is
+orthogonal to shard count, so RETRIEVE-vs-RETRIEVE on the same prefix still queues no matter
+how many shards exist. Heartbeat and ack don't need that lock, so they get the full benefit of
+shard-level parallelism -- which is exactly why the real benchmark (see "## Benchmark Results")
+showed heartbeat/ack getting 8-12x faster even in the worst-case scenario where RETRIEVE
+latency stayed flat.
+
+**Why the latency itself matters, not just the number**: heartbeats exist so a pod can say "I'm
+still working on item X" and keep it from being treated as orphaned. The `heartbeat_timeout`
+check (`filter_to_cancel` in `cache_rocksstore.rs`, exercised by the background orphan scan --
+see "What About Orphan Detection?" in the appendix below) looks at wall-clock time since the
+last recorded heartbeat, with no way to distinguish "the pod died" from "the pod's heartbeat call is alive
+and well but stuck in line behind someone else's slow retrieve." Before Stage 1, a busy queue
+could make that second case common: a heartbeat delayed long enough by queueing (not by the pod
+actually failing) would cross `heartbeat_timeout`, get the item cancelled via `queue_cancel`,
+and return a perfectly healthy, still-in-progress query to Pending -- wasting the work already
+done and forcing a retry. Sharding removes the specific cause of that false positive: heartbeat
+latency is no longer coupled to how much unrelated queue traffic exists, only to per-shard
+load, which the benchmark shows is dramatically lower.
+
 ---
 
 ## Comparison Summary
@@ -937,11 +993,19 @@ Benchmark Process" below for exact commands).
 ### What's benchmarked
 
 `benches/cachestore_queue_concurrent.rs` spawns `BENCH_PODS` concurrent async tasks ("pods"),
-each looping `BENCH_ITERS_PER_POD` times through the real lifecycle: `queue_add` ->
-`queue_retrieve_by_path` -> `queue_heartbeat` (x `BENCH_HEARTBEATS_PER_ITEM`) -> `queue_ack`.
-It measures aggregate throughput (total ops / wall-clock) and per-operation-type p50/p90/p99
-latency. Both runs below use 100 pods x 20 iterations x 3 heartbeats/item = 12,000 total ops,
-release build (`--release`; a debug build would not be representative of real op costs).
+each looping `BENCH_ITERS_PER_POD` times through the same per-query lifecycle a real Cube.js
+pod goes through against the queue (see "Appendix: How Pods Discover Unpicked Queries" / "The
+Coordination Model" above): `queue_add` (submit a query) -> `queue_retrieve_by_path` (claim a
+pending item) -> `queue_heartbeat` repeated `BENCH_HEARTBEATS_PER_ITEM` times (simulating the
+periodic "still working on it" calls a pod makes while actually executing a query) ->
+`queue_ack` (hand back the result). This is deliberately *not* an arbitrary mix of the four
+operation types -- it's the real per-item call pattern, run concurrently across many
+simulated pods, which is what makes the per-operation-type latency numbers below meaningful for
+the "why heartbeat/ack latency matters" discussion above rather than just a synthetic load
+test. It measures aggregate throughput (total ops / wall-clock) and per-operation-type
+p50/p90/p99 latency. Both runs below use 100 pods x 20 iterations x 3 heartbeats/item = 12,000
+total ops, release build (`--release`; a debug build would not be representative of real op
+costs).
 
 Two scenarios were measured, because they tell materially different stories:
 
