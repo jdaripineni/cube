@@ -139,6 +139,10 @@ name = "cachestore_queue_concurrent"
 harness = false
 
 [[bench]]
+name = "cachestore_queue_pickup_latency"
+harness = false
+
+[[bench]]
 name = "metastore"
 harness = false
 

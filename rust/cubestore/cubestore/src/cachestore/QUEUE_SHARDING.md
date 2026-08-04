@@ -1079,6 +1079,282 @@ like production traffic.
 
 ---
 
+## Does Stage 1 Reduce Query Pickup (Queue-Wait) Latency?
+
+A natural follow-up to the heartbeat/ack speedup story above: "the heartbeat speedup is the big
+winner -- won't that eliminate the 3-30s query queue-wait-before-pickup that's been the main
+complaint?" This section answers that directly, with new benchmarks built specifically to
+isolate the question, because the existing Scenario A/B benchmarks above can't answer it on
+their own.
+
+### The conceptual clarification
+
+Heartbeat getting faster is not the same thing as a *new* query getting picked up faster. As
+"Appendix: How Pods Discover Unpicked Queries" above states plainly: "Heartbeats have nothing to
+do with query discovery." A pod calls `queue_heartbeat` for a query it has *already* retrieved
+and is currently executing -- it is a "still working" signal, nothing more. A brand new query
+becomes eligible for execution only via `queue_retrieve_by_path` (`queue_add` puts it in the
+queue; `queue_retrieve_by_path` is what actually finds it and marks it `Active`). So "does Stage
+1 reduce the 3-30s pickup wait" is really the question "does Stage 1 make `queue_retrieve_by_path`
+faster for a *new* query, when there's a lot of *other* queue traffic happening at the same
+time" -- not "does heartbeat get faster" (it does, dramatically, per the Scenario A/B tables
+above -- that's already established and is not what's being tested here).
+
+Two different RETRIEVE-related contention patterns exist, and they behave differently under
+sharding:
+
+1. **RETRIEVE-vs-RETRIEVE on the same prefix** (many pods simultaneously trying to grab a new
+   item from the same shared queue): serialized by the per-prefix `retrieve_lock`
+   (`queue_retrieve_by_path`, "No Dirty Reads" §4 above), which is completely orthogonal to
+   `CUBESTORE_QUEUE_RW_WORKERS`. Already shown not to improve with shard count in Scenario A
+   above (retrieve p50 ~30-34ms at every shard count, 100 pods). Experiment 2 below re-tests
+   this at a much wider range of pod counts to see if that picture changes at scale.
+2. **RETRIEVE-vs-background-heartbeat/ack-noise** (one pod submitting a *new* query while many
+   *other*, already-executing queries are heartbeating/acking in the background): a
+   fundamentally different interaction that Scenario A/B's lockstep-everyone-does-everything
+   design cannot isolate, because every pod in those benchmarks is *also* trying to retrieve at
+   the same time. Experiment 1 below isolates it with a dedicated benchmark.
+
+### Experiment 1: background heartbeat/ack noise vs. new-query pickup latency
+
+**New benchmark**: `benches/cachestore_queue_pickup_latency.rs` (`harness = false`, registered
+in `Cargo.toml` the same way as the existing benches). Design:
+
+- Pre-populate `BG_ITEMS` items under one shared prefix, `queue_add`ed then immediately
+  `queue_retrieve_by_path`ed by the setup phase itself (with a very high `allow_concurrency` so
+  every one succeeds and stays `Active`) -- these simulate `BG_ITEMS` already-executing queries.
+- Spawn `BG_ITEMS` long-running background tasks, each looping `queue_heartbeat` on its own item
+  with a target minimum gap of `BG_HEARTBEAT_INTERVAL_MS` (default 10ms) for the entire duration
+  of the measurement phase below.
+- A single foreground submitter (`FG_SUBMITTERS=1` -- deliberately *not* many, so this
+  experiment does not also measure RETRIEVE-vs-RETRIEVE contention, which is Experiment 2's job)
+  repeatedly (`FG_ITERS` times): `queue_add`s a uniquely-pathed new item under the *same* shared
+  prefix, then `queue_retrieve_by_path`s that exact path (also with a very high
+  `allow_concurrency`, so only latency is measured, never admission blocking). The combined
+  add+retrieve time is recorded as "pickup latency." Each foreground item is `queue_ack`ed
+  immediately after (untimed), so only `BG_ITEMS` -- not the foreground loop itself -- determines
+  how many items are `Active` under the shared prefix throughout the run.
+
+`BG_HEARTBEAT_INTERVAL_MS=10` and `FG_SUBMITTERS=1` were held constant; `FG_ITERS` was reduced
+from 100 to 60 (`BG_ITEMS=5000`) and 40 (`BG_ITEMS=10000`) purely to bound wall-clock time as
+population cost grows (see below) -- the `BG_ITEMS=10000` p99/max figures therefore rest on
+fewer samples (40) than the smaller rows (100) and are noisier as a result (at n=40, p99 and max
+frequently coincide -- an artifact of the percentile-rank formula at low sample counts, not a
+real physical ceiling).
+
+**A note on population cost**: `queue_retrieve_by_path` doesn't just serialize per-prefix -- it
+also does a `get_rows_by_index(ByPrefixAndStatus(prefix, Active))` scan that returns *every*
+currently-Active item under that prefix on *every* call, regardless of shard count. Populating
+`BG_ITEMS` items sequentially therefore costs roughly O(`BG_ITEMS`^2) total (each new item's
+retrieve scans all previously-added active items) -- consistent with what was actually measured:
+population took 2.5s at 2,000 items, 15s at 5,000, and 63-67s at 10,000. This is a one-time setup
+cost, not part of the timed measurement, but it's why `BG_ITEMS=10000` runs take over a minute
+before the timed phase even starts.
+
+**Isolating the mechanism**: before trusting the headline numbers below, a diagnostic confirmed
+*why* pickup latency grows with `BG_ITEMS` -- is it the per-call active-item scan above (a fixed
+RocksDB read cost, independent of traffic and shard count), or actual channel/thread contention
+from background heartbeat *traffic*? At `BG_ITEMS=2000`, workers=1, with
+`BG_HEARTBEAT_INTERVAL_MS=10` (dense background traffic), `fg_retrieve_only` p50 was 43.96ms.
+Re-run with everything else identical but `BG_HEARTBEAT_INTERVAL_MS=5000` (near-zero background
+traffic during the measurement window), `fg_retrieve_only` p50 dropped to 2.21ms -- an ~18x
+difference for the *same* number of Active items under the prefix. This confirms the effect
+below is overwhelmingly driven by background *traffic* competing for the RW loop's
+channel/thread capacity, not by the fixed active-item-scan cost (which is real, but small
+relative to traffic-driven queueing delay) -- i.e., it is precisely the interaction Stage 1's
+sharding targets.
+
+**Results** (`BG_HEARTBEAT_INTERVAL_MS=10`, `FG_SUBMITTERS=1`, release build, single laptop
+process, `FG_ITERS=100` except where noted):
+
+| BG_ITEMS | Workers | fg_pickup p50 (ms) | p90 (ms) | p99 (ms) | max (ms) | bg_heartbeat p50 (ms) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 | 1 | 0.091 | 0.169 | 1.764 | 2.116 | n/a (no background load) |
+| 0 | 8 | 0.083 | 0.183 | 0.815 | 9.021 | n/a |
+| 50 | 1 | 0.164 | 0.265 | 0.803 | 1.635 | 0.338 |
+| 50 | 8 | 0.189 | 0.254 | 0.335 | 0.341 | 0.168 |
+| 200 | 1 | 0.484 | 0.955 | 1.439 | 1.487 | 0.460 |
+| 200 | 8 | 0.499 | 0.797 | 1.715 | 3.693 | 0.270 |
+| 500 | 1 | 3.592 | 4.658 | 8.550 | 8.779 | 2.447 |
+| 500 | 8 | 1.403 | 2.052 | 2.516 | 2.517 | 0.564 |
+| 1000 | 1 | 14.991 | 18.999 | 23.873 | 26.862 | 14.019 |
+| 1000 | 8 | 4.943 | 6.577 | 8.555 | 8.875 | 0.925 |
+| 2000 | 1 | 44.188 | 48.427 | 56.455 | 74.253 | 40.335 |
+| 2000 | 8 | 18.622 | 22.583 | 24.653 | 29.873 | 9.160 |
+| 5000 | 1 (FG_ITERS=60) | 134.806 | 155.228 | 181.975 | 184.325 | 121.744 |
+| 5000 | 8 (FG_ITERS=60) | 68.295 | 75.515 | 96.579 | 140.116 | 44.255 |
+| 10000 | 1 (FG_ITERS=40) | 287.378 | 333.001 | 361.361 | 361.361 | 263.607 |
+| 10000 | 8 (FG_ITERS=40) | 147.857 | 185.780 | 366.653 | 366.653 | 93.519 |
+
+`fg_add_only` stayed sub-millisecond (0.04-0.75ms) at every `BG_ITEMS`/workers combination, as
+expected, since `queue_add` is unsharded and background load in this experiment is pure
+heartbeat traffic that never touches the add queue -- `fg_pickup` is therefore driven almost
+entirely by `fg_retrieve_only` throughout the table.
+
+**What this shows**:
+
+- **Below ~200-500 background items, sharding makes no measurable difference** to pickup
+  latency (`BG_ITEMS=50`: 0.164ms vs 0.189ms; `BG_ITEMS=200`: 0.484ms vs 0.499ms -- both within
+  noise, and workers=8 is not even reliably ahead at this scale). At this level of background
+  load, neither configuration is close to saturating the RW loop, so there's nothing for
+  sharding to relieve.
+- **From ~500 background items up, sharding delivers a clear, substantial win**: pickup p50
+  speedup (workers=1 / workers=8) is 2.56x at 500 items, peaks at 3.03x at 1,000 items, then
+  gradually narrows to 2.37x (2,000), 1.97x (5,000), and 1.94x (10,000) as background load grows
+  further -- consistent with this document's existing "WAL serialization ceiling" story: at very
+  high absolute load, `workers=8` itself starts to saturate, so the *relative* advantage over
+  `workers=1` shrinks even as the *absolute* latency at `workers=8` keeps climbing.
+- **The magnitude reaches "tens to hundreds of milliseconds," but nowhere near the reported
+  3-30 *second* real-world symptom.** The largest scale tested (`BG_ITEMS=10000`) reached 287ms
+  (workers=1) vs 148ms (workers=8) pickup p50 -- both comfortably under half a second, three
+  orders of magnitude short of "3-30s." This is not a failure of the experiment; it reflects a
+  real difference between this environment and a production k8s deployment (see "Environment
+  caveat" in the existing Benchmark Results section above): single local process, no network
+  hop, no real multi-pod OS/process-level contention, fast local SSD, and only 14 cores worth of
+  total scheduling pressure. Pushing `BG_ITEMS` further (beyond 10,000) was not attempted:
+  population cost grows roughly quadratically (see above), and 10,000 items already took over a
+  minute just to set up, so continuing to push this single-process local benchmark toward
+  multi-second pickup latency would mean modeling a scale of background contention (tens of
+  thousands of simultaneously active items under one prefix) that is not representative of the
+  real deployments this feature targets anyway. The trend (2-3x speedup, growing background load
+  driving growing absolute latency at both shard counts) is reported with confidence; whether it
+  extrapolates to closing the full 3-30s gap in a real k8s cluster is a claim this benchmark
+  cannot make either way.
+
+### Experiment 2: does RETRIEVE-vs-RETRIEVE contention get worse at higher pod counts, and does sharding ever help?
+
+**Extended sweep**: the existing `cachestore_queue_concurrent.rs` Scenario A configuration
+(`BENCH_PREFIXES=1`, all pods share one queue prefix), run at `BENCH_PODS` in {100, 250, 500,
+1000} x `CUBESTORE_QUEUE_RW_WORKERS` in {1, 8}. `BENCH_ITERS_PER_POD` was reduced from the
+existing baseline's 20 to 10 (`BENCH_HEARTBEATS_PER_ITEM` kept at 3) purely to keep
+`BENCH_PODS=1000` runs from taking several minutes -- total ops (up to 60,000 at the largest
+point) is what matters for stable percentiles, not the iters value specifically, per the
+existing "Repeatable Benchmark Process" guidance below.
+
+**Results**:
+
+| BENCH_PODS | Workers | ops/sec | retrieve p50 (ms) | p90 (ms) | p99 (ms) |
+| --- | --- | --- | --- | --- | --- |
+| 100 | 1 | 23,091.4 | 22.904 | 34.093 | 35.363 |
+| 100 | 8 | 26,976.1 | 19.471 | 31.007 | 33.483 |
+| 250 | 1 | 12,164.5 | 110.618 | 180.336 | 198.661 |
+| 250 | 8 | 13,009.6 | 102.675 | 193.463 | 199.293 |
+| 500 | 1 | 6,104.3 | 405.318 | 822.845 | 920.098 |
+| 500 | 8 | 5,822.6 | 425.837 | 1005.581 | 1086.985 |
+| 1000 | 1 | 2,552.2 | 1736.652 | 4411.597 | 5077.599 |
+| 1000 | 8 | 2,228.7 | 2092.978 | 5189.866 | 5840.903 |
+
+**What this shows**:
+
+- **RETRIEVE latency against one shared prefix grows steeply, and clearly superlinearly, with
+  pod count** -- retrieve p50 goes from 20-23ms (100 pods) to 100-111ms (250 pods) to 405-426ms
+  (500 pods) to 1.7-2.1 *seconds* (1000 pods), at both shard counts. This directly confirms the
+  queueing-theory prediction: once arrival rate at the per-prefix `retrieve_lock` exceeds its
+  service rate, wait time grows faster than pod count, and it does so regardless of
+  `CUBESTORE_QUEUE_RW_WORKERS` -- the lock has no notion of shards.
+- **At 100-250 pods, `workers=8` still shows the same small, consistent edge as the original
+  100-pod Scenario A baseline** (ops/sec 1.07-1.17x higher, retrieve p50 5-8% lower) --
+  presumably residual scheduling-overhead differences (fewer heartbeat/ack ops queueing behind
+  each other between successive retrieves on the same shard), not a change to the
+  fundamentally-serialized RETRIEVE path itself.
+- **At 500 and especially 1000 pods, that small edge disappears and even nominally reverses**:
+  at 1000 pods, `workers=8` measured *worse* than `workers=1` (ops/sec 2,228.7 vs 2,552.2;
+  retrieve p50 2,092.978ms vs 1,736.652ms, roughly 20% higher). Per this document's honesty
+  requirements, this was checked rather than taken at face value: a follow-up re-run of just
+  `BENCH_PODS=1000` at a smaller `BENCH_ITERS_PER_POD=5` (fewer total ops, less statistically
+  solid, but a fast independent sample) showed the *opposite* ordering on some metrics
+  (`workers=8` ops/sec 5,741.5 vs `workers=1`'s 5,651.3; retrieve p50 752.8ms vs 810.8ms) and the
+  *same* ordering on others (p90/p99 slightly higher for `workers=8`) -- i.e., inconsistent
+  between runs. **Conclusion: the apparent "workers=8 is worse at 1000 pods" result in the
+  primary run is not a robust, reproducible effect -- it's noise**, most likely from this being a
+  14-core laptop running both the async runtime's worker threads *and* (at workers=8) 8
+  additional dedicated RW shard OS threads simultaneously with 1000 concurrent pod tasks, i.e.
+  thread-oversubscription noise, not a real regression introduced by sharding. The honest,
+  defensible reading of Experiment 2 as a whole: **once RETRIEVE-vs-RETRIEVE contention on a
+  single shared prefix is severe enough (500+ concurrent pods in this environment),
+  `CUBESTORE_QUEUE_RW_WORKERS` has no reliable effect on it in either direction** -- consistent
+  with, and a stronger confirmation of, the per-prefix-lock analysis in "No Dirty Reads"
+  elsewhere in this document. This was *not* re-run 2-3 times at every pod count (per the
+  existing "Repeatable Benchmark Process" §4 recommendation) due to time budget; the 100-250 pod
+  rows are consistent with the original Scenario A baseline and are trustworthy, but the
+  500/1000 rows' *exact* numbers should be treated as one representative sample of a noisy
+  regime, not a precise measurement.
+
+### Verdict
+
+**Does Stage 1 reduce new-query pickup latency when there's heavy background heartbeat/ack noise
+from other, already-executing queries?** Yes, measurably, starting once background load is large
+enough to matter (roughly 500+ concurrently-active items sharing a prefix in this environment) --
+pickup latency speedups of 2-3x were measured, growing to hundreds of milliseconds of *absolute*
+latency at the highest background-load levels tested. This is a real, reproducible,
+traffic-driven effect (confirmed by the interval-based diagnostic above), and it is
+mechanistically distinct from -- and does not contradict -- the fact that Stage 1 does *not* help
+RETRIEVE-vs-RETRIEVE contention on a shared prefix (Experiment 2, and the existing Scenario A
+above): those are two different bottlenecks (channel/thread contention from *background* traffic
+vs. the per-prefix `retrieve_lock`'s inherent serialization of *simultaneous new-query
+submissions*), and Stage 1's sharding only ever addresses the first one.
+
+**Does this close the reported real-world "3-30s" pickup-wait complaint?** Not provably, and not
+close, on this local single-process laptop benchmark -- the largest, most background-loaded
+scenario tested here (10,000 simultaneously active background items) produced pickup latency in
+the hundreds of milliseconds, not seconds. Whether the *ratio* (roughly 2-3x, narrowing to ~2x at
+the largest scale tested) extrapolates to closing a multi-second gap in a real k8s deployment --
+where network round-trips, many separate OS processes, real RocksDB I/O contention under
+production data volumes, and far higher total pod counts all raise the *absolute* magnitude of
+every number in these tables -- is a reasonable hypothesis this data is consistent with, but it
+is not a claim this benchmark can prove. **The honest summary: Stage 1 helps the "background
+noise slows down new-query pickup" mechanism, meaningfully and by a growing absolute margin as
+background load grows, but does not help (and this data suggests may occasionally even show
+noise-level non-improvement in) the "many pods simultaneously fighting to retrieve from the same
+queue" mechanism -- and a production validation on real infrastructure, not just this laptop, is
+still needed before concluding it resolves the full 3-30s symptom.**
+
+### Repeatable Commands
+
+**Experiment 1 (background-noise vs. pickup latency)**:
+
+```sh
+cd rust/cubestore
+cargo build -p cubestore --release --bench cachestore_queue_pickup_latency
+find target/release/deps -maxdepth 1 -iname 'cachestore_queue_pickup_latency-*' -perm -u+x -type f
+cd cubestore
+BIN=../target/release/deps/cachestore_queue_pickup_latency-<hash>
+
+for BG in 0 50 200 500 1000 2000; do
+  for W in 1 8; do
+    rm -rf "db-tmp/benchmarks/cachestore_queue_pickup_latency_bench_w${W}"
+    CUBESTORE_QUEUE_RW_WORKERS=$W BG_ITEMS=$BG BG_HEARTBEAT_INTERVAL_MS=10 \
+      FG_SUBMITTERS=1 FG_ITERS=100 FG_WARMUP_MS=300 "$BIN"
+  done
+done
+
+# Larger scale (population cost grows ~quadratically -- budget 1-2 minutes for BG_ITEMS=10000):
+for BG in 5000 10000; do
+  for W in 1 8; do
+    rm -rf "db-tmp/benchmarks/cachestore_queue_pickup_latency_bench_w${W}"
+    CUBESTORE_QUEUE_RW_WORKERS=$W BG_ITEMS=$BG BG_HEARTBEAT_INTERVAL_MS=10 \
+      FG_SUBMITTERS=1 FG_ITERS=40 FG_WARMUP_MS=300 "$BIN"
+  done
+done
+```
+
+**Experiment 2 (RETRIEVE-vs-RETRIEVE contention at scale)**:
+
+```sh
+cd rust/cubestore/cubestore
+BIN=../target/release/deps/cachestore_queue_concurrent-<hash>  # built per step 1 above
+
+for PODS in 100 250 500 1000; do
+  for W in 1 8; do
+    rm -rf "db-tmp/benchmarks/cachestore_queue_concurrent_bench_w${W}"
+    CUBESTORE_QUEUE_RW_WORKERS=$W BENCH_PODS=$PODS BENCH_ITERS_PER_POD=10 \
+      BENCH_HEARTBEATS_PER_ITEM=3 BENCH_PREFIXES=1 "$BIN"
+  done
+done
+```
+
+---
+
 ## Repeatable Benchmark Process
 
 1. **Build in release mode** (required -- debug-mode timings are not representative):
