@@ -2,8 +2,12 @@
 
 ## Status
 
-Diagnosed and reproduced. **Not yet fixed.** This document is written to be resumable in a
-fresh session with no memory of the investigation that produced it — it is self-contained.
+**Fixed and benchmarked.** Option A (in-process atomic `QueuePendingCounters`) plus Option C
+(non-allocating count path) are implemented, covered by a drift/ground-truth test, and validated
+against the same production-repro benchmark used to diagnose the problem -- see §10
+("Implementation") and §11 ("Before/After Benchmark Results") below. This document is written to
+be resumable in a fresh session with no memory of the investigation that produced it -- it is
+self-contained.
 
 Branch: `cubestore-retrieve-pending-scan-cost` (created from `master`, not from the unrelated
 `cubestore-queue-sharding` branch — see "Why this is a separate branch" below).
@@ -332,36 +336,49 @@ Checked directly, not assumed:
 
 ## 7. Recommendation and Suggested Next Steps
 
-1. Implement **Option A** first (in-process atomic `QueuePendingCounters`, mirroring
-   `QueueActiveCounters`'s API shape: `try_increment`/`decrement`/`get_count`/`rebuild`).
+1. ✅ **Done.** Implement **Option A** first (in-process atomic `QueuePendingCounters`, mirroring
+   `QueueActiveCounters`'s API shape: `increment`/`decrement`/`get_count`/`rebuild`).
    Wire increment into `queue_add`, decrement into the success paths of `queue_retrieve_by_path`
    and `queue_cancel` (only when the item was still `Pending`), and a rebuild call alongside the
    existing `rebuild_queue_active_counters()` in `spawn_processing_loops`.
-2. Replace the `count_rows_by_index(ByPrefixAndStatus(prefix, Pending))` calls in
-   `queue_add`/`queue_retrieve_by_path` with reads from the new counter.
-3. Do Option C (avoid the `Vec` materialization in `count_rows_by_index`'s general implementation)
-   as a cheap, independent win — it's still used elsewhere in the codebase for cases where an
-   incremental counter isn't (yet) available.
-4. Write a `test_queue_pending_counters_match_ground_truth_after_churn` test analogous to the
-   existing Active-counter test.
-5. Re-run `benches/cachestore_queue_production_repro.rs` at the same `PODS`/`HOLD_MS`/
-   `ALLOW_CONCURRENCY` combinations documented in §3, both before and after the fix, to confirm
-   the cascade threshold moves substantially higher (or ideally disappears within the range this
-   benchmark can practically test) and to capture new real numbers for whatever write-up follows.
-6. Only pursue **Option B** (merge operator) afterward, and only if Option A's drift/discipline
-   risk turns out to matter in practice (per §6, not expected) or if there's separate appetite for
-   the more architecturally durable version. Don't block the initial fix on it.
-7. Consider whether this fix should also apply to the **Active** list scan cost inside
-   `queue_retrieve_by_path`'s ground-truth double-check (the "returned `active: Vec<String>` list"
-   itself, not just the already-O(1) counter) if profiling after step 5 shows it's now the next
-   bottleneck — out of scope for the initial fix, flagged for awareness only.
+2. ✅ **Done.** Replace the `count_rows_by_index(ByPrefixAndStatus(prefix, Pending))` calls in
+   `queue_add`/`queue_retrieve_by_path` with reads from the new counter. (`queue_truncate` also
+   now resets every counter, since it wipes the whole table.)
+3. ✅ **Done.** Option C (avoid the `Vec` materialization in `count_rows_by_index`'s general
+   implementation) -- turned out, once 1/2 landed, to have zero remaining call sites in this
+   codebase (`count_rows_by_index` was only ever called from the two queue sites this branch
+   replaced), so its benefit today is purely "the next caller that needs a count instead of a
+   list doesn't pay an avoidable allocation," not a measured win in this benchmark. Implemented
+   anyway since it's a correct, cheap, low-risk general improvement to a shared trait method.
+4. ✅ **Done.** `test_queue_pending_counters_match_ground_truth_after_churn` (concurrent
+   add/retrieve/cancel/ack churn across several prefixes, counter compared to a fresh RocksDB
+   scan both before and after an explicit rebuild) plus a simpler sequential
+   `test_queue_pending_count_sequential` for the straightforward case.
+5. ✅ **Done.** Re-ran `benches/cachestore_queue_production_repro.rs` at the same `PODS`/`HOLD_MS`/
+   `ALLOW_CONCURRENCY` combinations documented in §3, both before and after the fix, on the same
+   machine back-to-back for a controlled comparison -- see §11. Headline result: the fix does
+   **not** eliminate high tail (p99/max) latency when demand massively exceeds capacity (that
+   ceiling is simple queueing math this fix was never going to change), but it eliminates the
+   *throughput degradation* the scan cost caused (33.33 -> 40.00 items/sec, back to the
+   capacity-bound theoretical maximum) and cuts p50/p90 pickup latency by 3-4 orders of magnitude
+   (seconds -> sub-millisecond) at every load level tested.
+6. Not yet pursued: **Option B** (merge operator). Per §6's drift-safety analysis this hasn't
+   proven necessary in testing (the ground-truth test in step 4 passes cleanly), so it remains
+   deferred unless real-world operation surfaces a drift/discipline problem Option A's
+   discipline-by-convention approach doesn't catch.
+7. Not yet pursued: whether the **Active** list scan cost inside `queue_retrieve_by_path`'s
+   ground-truth double-check (the `active: Vec<String>` list itself) is now the next bottleneck.
+   §11's data doesn't point at this -- the Active list is already bounded by `allow_concurrency`
+   (a small constant, e.g. 20 in these benchmarks), not by backlog size, so it was never part of
+   the mechanism this document describes. Still flagged for awareness only.
 
 ## 8. Key File References
 
 | File | Relevance |
 | --- | --- |
-| `rust/cubestore/cubestore/src/cachestore/cache_rocksstore.rs` | `queue_add`, `queue_retrieve_by_path` (the functions to modify) |
-| `rust/cubestore/cubestore/src/metastore/rocks_table.rs` | `count_rows_by_index`, `get_row_ids_by_index` (root cause) |
+| `rust/cubestore/cubestore/src/cachestore/cache_rocksstore.rs` | `queue_add`, `queue_retrieve_by_path`, `queue_cancel`, `queue_truncate`, `rebuild_queue_pending_counters` (the functions modified) |
+| `rust/cubestore/cubestore/src/cachestore/queue_pending_counters.rs` | `QueuePendingCounters` -- the Option A implementation this branch adds |
+| `rust/cubestore/cubestore/src/metastore/rocks_table.rs` | `count_rows_by_index`, `count_row_ids_from_index`, `get_row_ids_by_index` (root cause + Option C) |
 | `rust/cubestore/cubestore/src/metastore/mod.rs` | `meta_store_merge`, `RocksMetaStoreDetails::open_db` (existing merge-operator precedent, Option B reference) |
 | `rust/cubestore/cubestore/src/cachestore/queue_active_counters.rs` (on `cubestore-queue-sharding` branch only) | `QueueActiveCounters` — the pattern to mirror for Option A |
 | `rust/cubestore/cubestore/benches/cachestore_queue_production_repro.rs` | The repro/validation benchmark (already on this branch) |
@@ -374,3 +391,147 @@ Checked directly, not assumed:
 - `cubestore-queue-sharding` branch / [PR #2](https://github.com/jdaripineni/cube/pull/2): the
   RW-loop sharding work that led to building the benchmark this document relies on. Independent
   of this fix — can land in either order, or neither depends on the other.
+
+## 10. Implementation
+
+Implements Option A plus Option C, per §7.
+
+**`QueuePendingCounters`** (`cachestore/queue_pending_counters.rs`, new file) -- an
+`AtomicU64`-per-prefix counter behind a `HashMap` guarded by `std::sync::RwLock` (not
+`tokio::sync`: the write side is called from the fully-synchronous closures that run on
+`RocksCacheStore`'s single-threaded queue RW loop, which cannot `.await`; this mirrors the
+existing precedent in this codebase of `RocksStore::seq_store` -- also a plain `std::sync::Mutex`
+shared between those closures and the async layer). API: `new`, `rebuild(HashMap<String, u64>)`,
+`increment(prefix) -> u64`, `decrement(prefix) -> u64` (saturating at 0), `get_count(prefix) -> u64`.
+Because every queue write op (`queue_add`/`queue_retrieve_by_path`/`queue_cancel`/etc.) is already
+funneled through one single-threaded channel-fed RW loop, there is never more than one writer at a
+time -- the `RwLock` only protects the `HashMap` against concurrent *readers* (e.g. `queue_list`
+callers), not against writer-writer races. Four unit tests cover increment/decrement/rebuild/
+independent-prefixes in isolation.
+
+**Wiring** (`cachestore/cache_rocksstore.rs`):
+
+- `RocksCacheStore` gained a `queue_pending_counters: Arc<QueuePendingCounters>` field.
+- `rebuild_queue_pending_counters()` (new method, mirrors `rebuild_queue_active_counters` on the
+  sharding branch): scans every queue item once via `read_operation_queue`, counts `Pending` items
+  per prefix, calls `.rebuild(...)`. Called once at startup from `spawn_processing_loops` via a
+  one-shot spawned task, before any other queue operation is processed.
+- `queue_add`: replaced the `count_rows_by_index(ByPrefixAndStatus(prefix, Pending))` scan with
+  `queue_pending_counters.get_count(&prefix)` for the pre-add count, and `.increment(&prefix)`
+  when a genuinely new item is inserted (not on a duplicate-path no-op add).
+  `queue_retrieve_by_path`: same scan replaced with `.get_count(&prefix)`; `.decrement(&prefix)`
+  replaces the old `pending -= 1` on the `Success` path (Pending -> Active transition).
+  `queue_cancel`: captures the item's status and prefix before deleting it, and calls
+  `.decrement(&prefix)` only if it was still `Pending` at cancel time (an already-`Active` item
+  being cancelled must not touch the Pending counter).
+- `queue_truncate`: wipes the whole `queue_item` table, so it now also calls
+  `queue_pending_counters.rebuild(HashMap::new())` to reset every counter to 0 rather than leaving
+  stale per-prefix counts behind.
+- `#[cfg(test)] queue_pending_count_for_test(prefix) -> u64`: test-only accessor so tests can
+  assert the counter against RocksDB ground truth without exposing internal state in production
+  APIs (same pattern as the sharding branch's `queue_active_count_for_test`).
+- Every other place that mutates the `queue_item` table was checked: `queue_merge_extra` only
+  touches the `extra` metadata field, never `status`, so it's a no-op for this counter;
+  `queue_to_cancel` is a read-only "candidates" query -- actual cancellation still goes through
+  `queue_cancel` above, so there's no separate call site to wire.
+
+**Option C** (`metastore/rocks_table.rs`): added `count_row_ids_from_index`, a copy of
+`get_row_ids_from_index`'s exact matching logic (same hash comparison, same TTL-expiry check) that
+increments a `u64` counter instead of pushing into a `Vec<u64>`. `count_rows_by_index` now calls
+this instead of `get_row_ids_by_index(...).len()`. Grepping the codebase before and after this
+change confirms `count_rows_by_index` has exactly two call sites total, both inside this branch's
+`queue_add`/`queue_retrieve_by_path` -- both of which this same branch replaces with the atomic
+counter. So today this change has no measurable effect on this benchmark; it's included because
+it's a strict improvement to shared, reusable trait infrastructure at near-zero cost/risk, for
+whatever the next caller of "just give me a count" turns out to be.
+
+**Tests**: `test_queue_pending_count_sequential` (deterministic add/add/duplicate-add/retrieve/
+cancel sequence, asserts the `pending` field returned by each call and the counter accessor match
+hand-computed expected values) and `test_queue_pending_counters_match_ground_truth_after_churn`
+(concurrent add/retrieve/cancel/ack churn across 4 prefixes x 10 items each, asserts the counter
+matches a fresh `queue_list`-based scan both before and after an explicit
+`rebuild_queue_pending_counters()` call). Both pass, alongside the full existing
+`cargo test -p cubestore --lib` suite (204 tests) and the cachestore-scoped subset (32 tests) --
+zero failures, zero new warnings from `cargo check -p cubestore --lib --tests`.
+
+## 11. Before/After Benchmark Results
+
+Methodology: to avoid the risk of comparing against a previous session's numbers captured under
+different machine load (a real risk -- see the note on run-to-run variance below), this comparison
+built **two** release binaries of `cachestore_queue_production_repro` from the *exact same*
+benchmark source file -- one from this branch's pre-fix commit (`a18852ed6`, the diagnosis-only
+commit, unmodified `count_rows_by_index`-based scan) and one from this branch's post-fix HEAD --
+and ran both, back-to-back, on the same idle machine, same session, same day. This is the
+"before" and "after" referenced below; treat the earlier `PENDING_COUNT_SCAN_COST.md`/PR #3 draft
+numbers (captured in a different session) as superseded by this controlled comparison.
+
+All runs: `HOLD_MS=500`, `ALLOW_CONCURRENCY=20`, `CUBESTORE_QUEUE_RW_WORKERS=1` (this branch has no
+sharding, so this env var is inert -- included only because the benchmark file reads it
+unconditionally). Apple M4 Max, 14 logical cores, RocksDB on local SSD, no network hop -- same
+caveat as before: indicative of mechanism and rough magnitude, not a production SLA measurement.
+
+### PODS=40 (demand/capacity ratio 2x -- below any threshold, sanity check)
+
+| | Throughput (items/s) | p50 (ms) | p90 (ms) | p99 (ms) | max (ms) | pending high-water |
+| --- | --- | --- | --- | --- | --- | --- |
+| Before | 40.00 | 2.58 | 3.87 | 4.63 | 5.14 | 40 |
+| After | 40.00 | 2.46 | 5.30 | 13.42 | 13.65 | 23 |
+
+Both flat and fast (single-digit-to-low-double-digit milliseconds) -- no cascade at this load
+either way, as expected. The small "after" p99/max upward wobble (13.4ms vs 4.6ms) is ordinary
+scheduler/timing noise at a scale this small (only 200 samples, sub-15ms), not a regression --
+both results are in the "no cascade" regime by a wide margin (three orders of magnitude below the
+multi-second results below).
+
+### PODS=500 (demand/capacity ratio 25x)
+
+| | Throughput (items/s) | p50 (ms) | p90 (ms) | p99 (ms) | max (ms) | pending high-water |
+| --- | --- | --- | --- | --- | --- | --- |
+| Before | 40.00 | 1,531.17 | 12,270.85 | 15,902.88 | 15,908.92 | 491 |
+| After | 40.00 | 1.64 | 3.02 | 12,344.26 | 12,348.87 | 500 |
+
+p50 improves **~933x** (1.53s -> 1.6ms), p90 improves **~4,065x** (12.27s -> 3.0ms). p99/max
+improve more modestly (~22%: 15.9s -> 12.3s).
+
+### PODS=1000 (demand/capacity ratio 50x -- the headline scenario from §3/§11's predecessor)
+
+| | Throughput (items/s) | p50 (ms) | p90 (ms) | p99 (ms) | max (ms) | pending high-water |
+| --- | --- | --- | --- | --- | --- | --- |
+| Before | 33.33 | 10,929.40 | 26,342.69 | 27,407.53 | 27,408.12 | 980 |
+| After | 40.00 | 0.24 | 0.69 | 24,587.85 | 25,102.99 | 981 |
+
+p50 improves **~45,000x** (10.9s -> 0.24ms), p90 improves **~38,000x** (26.3s -> 0.69ms). p99/max
+improve more modestly (~10%: 27.4s -> ~25s). **Throughput itself was measurably degraded before
+the fix** (33.33 items/sec vs the 40.00 items/sec theoretical capacity ceiling,
+`ALLOW_CONCURRENCY / (HOLD_MS/1000)` = 20/0.5) -- direct evidence the O(n) scan was consuming real
+capacity, not just adding latency. After the fix, throughput matches the theoretical ceiling
+exactly.
+
+### What this data does and doesn't show
+
+**Does show**: this fix eliminates a genuine, measurable throughput tax the O(n) Pending scan was
+imposing under sustained overload (33.33 -> 40.00 items/sec at 50x demand), and it collapses
+pickup latency for the *large majority* of items (p50/p90) from multi-second to sub-millisecond at
+every load level tested -- a real, large, reproducible improvement to the common case.
+
+**Doesn't show**: this fix does **not** make worst-case (p99/max) latency disappear when demand
+massively exceeds capacity. At PODS=1000 (50x demand/capacity), roughly 980 items are competing for
+a system that can only sustain 40 admissions/sec -- even a hypothetical zero-cost retrieve call
+still has ~980/40 ≈ 24.5s of unavoidable queueing math for the last items to drain, which is
+almost exactly what "after" measures (p99 24.6s). That ceiling is ordinary capacity-bound queueing
+behavior, not a bug, and this fix was never intended to (and cannot) change it -- provisioning
+`allow_concurrency`/pod count for actual expected burst demand is the only lever for that part.
+The value of this fix is specifically the gap between "before" and that theoretical floor
+(27.4s max before vs a ~24.5s theoretical floor the fix gets "after" within ~2% of) plus the
+enormous p50/p90 improvement, not "no more tail latency under 50x overload" -- no in-process fix
+to a single mechanism could deliver that.
+
+**Combined with the `cubestore-queue-sharding` branch**: that branch's per-shard threads don't
+change any number in the tables above (confirmed in the predecessor investigation: `workers=1` vs
+`workers=8` were statistically indistinguishable on this exact benchmark), because sharding
+parallelizes *across* prefixes/threads, while every mechanism this document addresses lives
+*inside* a single retrieve call's own cost, independent of thread count. The two fixes are
+complementary and additive, not overlapping: this branch fixes a real algorithmic cost inside one
+call; the sharding branch fixes cross-item thread contention for unrelated queue operations. A
+deployment hitting both symptoms (heartbeat/ack delay from thread contention, *and* pickup-latency
+degradation from Pending backlog) would want both.

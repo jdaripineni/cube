@@ -796,8 +796,13 @@ pub trait RocksTable: BaseRocksTable + Debug + Send + Sync {
             )));
         }
 
-        let rows_ids = self.get_row_ids_by_index(row_key, secondary_index)?;
-        Ok(rows_ids.len() as u64)
+        let hash = secondary_index.typed_key_hash(&row_key);
+        let index_val = secondary_index.key_to_bytes(&row_key);
+        self.count_row_ids_from_index(
+            RocksSecondaryIndex::get_id(secondary_index),
+            &index_val,
+            hash.to_be_bytes(),
+        )
     }
 
     fn get_row_by_index_opt<K: Debug>(
@@ -1322,6 +1327,65 @@ pub trait RocksTable: BaseRocksTable + Debug + Send + Sync {
             };
         }
         Ok(res)
+    }
+
+    /// Same matching logic as `get_row_ids_from_index`, but counts matches instead of
+    /// materializing a `Vec<u64>` of row ids -- for callers that only need the count
+    /// (e.g. `count_rows_by_index`), this avoids an allocation that grows unbounded
+    /// with the number of matching rows.
+    fn count_row_ids_from_index(
+        &self,
+        secondary_id: u32,
+        secondary_key_val: &Vec<u8>,
+        secondary_key_hash: SecondaryKeyHash,
+    ) -> Result<u64, CubeError> {
+        let ref db = self.snapshot();
+        let key_len = secondary_key_hash.len();
+        let key_min = RowKey::SecondaryIndex(Self::index_id(secondary_id), secondary_key_hash, 0);
+
+        let mut count: u64 = 0;
+
+        let mut opts = ReadOptions::default();
+        opts.set_prefix_same_as_start(true);
+
+        let iter = db.iterator_opt(
+            IteratorMode::From(&key_min.to_bytes()[0..(key_len + 5)], Direction::Forward),
+            opts,
+        );
+        let index = self.get_index_by_id(secondary_id);
+
+        for kv_res in iter {
+            let (key, value) = kv_res?;
+            if let RowKey::SecondaryIndex(_, secondary_index_hash, _row_id) =
+                RowKey::from_bytes(&key)
+            {
+                if secondary_index_hash.len() != secondary_key_hash.len()
+                    || secondary_index_hash != secondary_key_hash
+                {
+                    break;
+                }
+
+                let (hash, expire) =
+                    match RocksSecondaryIndexValue::from_bytes(&*value, index.value_version())? {
+                        RocksSecondaryIndexValue::Hash(h) => (h, None),
+                        RocksSecondaryIndexValue::HashAndTTL(h, expire) => (h, expire),
+                        RocksSecondaryIndexValue::HashAndTTLExtended(h, expire, _) => (h, expire),
+                    };
+
+                if hash.len() != secondary_key_val.len() || hash != secondary_key_val.as_slice() {
+                    continue;
+                }
+
+                if let Some(expire) = expire {
+                    if expire > self.table_ref().start_time {
+                        count += 1;
+                    }
+                } else {
+                    count += 1;
+                }
+            };
+        }
+        Ok(count)
     }
 
     fn delete_all_rows_from_table(
