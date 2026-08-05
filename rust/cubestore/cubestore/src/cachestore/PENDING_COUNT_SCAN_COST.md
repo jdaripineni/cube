@@ -665,17 +665,17 @@ Given pronounced bistability observed even within this session (see below), this
 **three times per arm** rather than once, specifically to avoid presenting a single lucky-or-unlucky
 sample as if it were deterministic.
 
-| Arm | Run | Throughput | p50 | p99 | max |
-| --- | --- | --- | --- | --- | --- |
-| No optimization | 1 | 40.00/s | 16,558ms | 26,836ms | 27,363ms |
-| No optimization | 2 | 37.00/s | 12,961ms | 26,945ms | 27,473ms |
-| No optimization | 3 | 35.33/s | 12,526ms | 27,254ms | 27,375ms |
-| Option A | 1 | 40.00/s | 0.63ms | 1.21ms | 1.24ms |
-| Option A | 2 | 40.00/s | 1.30ms | 5.43ms | 5.46ms |
-| Option A | 3 | 40.00/s | 0.46ms | 25,594ms | 26,101ms |
-| Option B | 1 | 40.00/s | 0.70ms | 21,434ms | 24,576ms |
-| Option B | 2 | 40.00/s | 1.44ms | 2.01ms | 2.03ms |
-| Option B | 3 | 40.00/s | 0.60ms | 24,600ms | 25,116ms |
+| Arm | Run | Throughput | p50 | p75 | p90 | p95 | p99 | max |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| No optimization | 1 | 40.00/s | 16,558ms | 24,181ms | 25,790ms | 26,312ms | 26,836ms | 27,363ms |
+| No optimization | 2 | 37.00/s | 12,961ms | 19,164ms | 24,270ms | 26,391ms | 26,945ms | 27,473ms |
+| No optimization | 3 | 35.33/s | 12,526ms | 19,042ms | 22,132ms | 24,761ms | 27,254ms | 27,375ms |
+| Option A | 1 | 40.00/s | 0.63ms | 0.75ms | 0.87ms | 0.94ms | 1.21ms | 1.24ms |
+| Option A | 2 | 40.00/s | 1.30ms | 2.24ms | 5.14ms | 5.28ms | 5.43ms | 5.46ms |
+| Option A | 3 | 40.00/s | 0.46ms | 19,926ms | 24,056ms | 24,574ms | 25,594ms | 26,101ms |
+| Option B | 1 | 40.00/s | 0.70ms | 1.01ms | 11,205ms | 19,368ms | 21,434ms | 24,576ms |
+| Option B | 2 | 40.00/s | 1.44ms | 1.66ms | 1.83ms | 1.90ms | 2.01ms | 2.03ms |
+| Option B | 3 | 40.00/s | 0.60ms | 0.86ms | 1.85ms | 20,466ms | 24,600ms | 25,116ms |
 
 **What's consistent across all 3 runs, both fixed arms:**
 
