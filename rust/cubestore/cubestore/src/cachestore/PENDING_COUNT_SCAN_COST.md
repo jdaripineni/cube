@@ -2,12 +2,15 @@
 
 ## Status
 
-**Fixed and benchmarked.** Option A (in-process atomic `QueuePendingCounters`) plus Option C
-(non-allocating count path) are implemented, covered by a drift/ground-truth test, and validated
-against the same production-repro benchmark used to diagnose the problem -- see §10
-("Implementation") and §11 ("Before/After Benchmark Results") below. This document is written to
-be resumable in a fresh session with no memory of the investigation that produced it -- it is
-self-contained.
+**Fixed and benchmarked -- Option B is the currently-shipped fix.** Option A (in-process atomic
+`QueuePendingCounters`) was implemented and benchmarked first (§10-11); it was then **superseded**
+by Option B (a RocksDB merge-operator-backed counter, §12), chosen over Option A for durability
+(survives a process restart with no rebuild-from-scan step) and because its update is embedded in
+the same atomic `WriteBatch` as the real state change rather than a separate, independently
+forgettable bookkeeping call. §13 has a **3-way benchmark comparison** (no optimization / Option A
+/ Option B) run on the same machine, same session. Option C (non-allocating count path) remains
+implemented regardless of A vs. B. This document is written to be resumable in a fresh session
+with no memory of the investigation that produced it -- it is self-contained.
 
 Branch: `cubestore-retrieve-pending-scan-cost` (created from `master`, not from the unrelated
 `cubestore-queue-sharding` branch — see "Why this is a separate branch" below).
@@ -242,6 +245,9 @@ itself). It plausibly exists on `master` today, independent of any sharding work
 
 ### Option A: In-process atomic counter (recommended as the pragmatic first fix)
 
+*Update: implemented first (§10), fully benchmarked (§11), then superseded by Option B (§12) --
+kept here unmodified as the historical record of the original tradeoff analysis.*
+
 Maintain a `Pending`-count analog of the sharding branch's `QueueActiveCounters`
 (`rust/cubestore/cubestore/src/cachestore/queue_active_counters.rs` on the
 `cubestore-queue-sharding` branch — worth reading directly as a design reference, even though this
@@ -259,6 +265,11 @@ code path that mutates `Pending` status without remembering to update the counte
 drift (see §6 for why this specific counter's drift has an unusually low blast radius).
 
 ### Option B: RocksDB merge operator (more architecturally "correct," more implementation effort)
+
+*Update: this is the option that shipped. See §12 for the actual implementation (key encoding,
+merge function, compaction-filter interaction, and a documented replication-path limitation not
+anticipated in this original analysis) and §13 for a 3-way benchmark against both Option A and no
+optimization.*
 
 This codebase already has working associative-merge-operator infrastructure — see
 `meta_store_merge` in `rust/cubestore/cubestore/src/metastore/mod.rs` (~line 1247), a
@@ -362,10 +373,14 @@ Checked directly, not assumed:
    *throughput degradation* the scan cost caused (33.33 -> 40.00 items/sec, back to the
    capacity-bound theoretical maximum) and cuts p50/p90 pickup latency by 3-4 orders of magnitude
    (seconds -> sub-millisecond) at every load level tested.
-6. Not yet pursued: **Option B** (merge operator). Per §6's drift-safety analysis this hasn't
-   proven necessary in testing (the ground-truth test in step 4 passes cleanly), so it remains
-   deferred unless real-world operation surfaces a drift/discipline problem Option A's
-   discipline-by-convention approach doesn't catch.
+6. ✅ **Done, now shipped.** Pursued **Option B** (merge operator) as well, and it superseded
+   Option A as the currently-shipped fix -- see §12 for the implementation and §13 for a 3-way
+   benchmark confirming it performs equivalently to Option A (no meaningful difference between A
+   and B in any measured number; both fix the same throughput/typical-latency problem this
+   document describes). Chosen for durability (survives restart, no rebuild scan) and because its
+   update is embedded in the same atomic batch as the real mutation, not deferred/discipline
+   risk as originally estimated in §6 (which not proving necessary in Option A's testing wasn't
+   the deciding factor here -- durability and architectural preference were).
 7. Not yet pursued: whether the **Active** list scan cost inside `queue_retrieve_by_path`'s
    ground-truth double-check (the `active: Vec<String>` list itself) is now the next bottleneck.
    §11's data doesn't point at this -- the Active list is already bounded by `allow_concurrency`
@@ -376,11 +391,12 @@ Checked directly, not assumed:
 
 | File | Relevance |
 | --- | --- |
-| `rust/cubestore/cubestore/src/cachestore/cache_rocksstore.rs` | `queue_add`, `queue_retrieve_by_path`, `queue_cancel`, `queue_truncate`, `rebuild_queue_pending_counters` (the functions modified) |
-| `rust/cubestore/cubestore/src/cachestore/queue_pending_counters.rs` | `QueuePendingCounters` -- the Option A implementation this branch adds |
+| `rust/cubestore/cubestore/src/cachestore/cache_rocksstore.rs` | `queue_add`, `queue_retrieve_by_path`, `queue_cancel`, `queue_truncate`, `RocksCacheStoreDetails::open_db`/`open_readonly_db` (merge operator registration) |
+| `rust/cubestore/cubestore/src/cachestore/queue_pending_counters.rs` | `QueuePendingCounters` + `queue_pending_count_merge` -- the currently-shipped Option B implementation (§12) |
+| `rust/cubestore/cubestore/src/cachestore/compaction.rs` | `MetaStoreCacheCompactionFilter::filter` -- allow-lists the `0xFE` counter-key tag (§12) |
 | `rust/cubestore/cubestore/src/metastore/rocks_table.rs` | `count_rows_by_index`, `count_row_ids_from_index`, `get_row_ids_by_index` (root cause + Option C) |
-| `rust/cubestore/cubestore/src/metastore/mod.rs` | `meta_store_merge`, `RocksMetaStoreDetails::open_db` (existing merge-operator precedent, Option B reference) |
-| `rust/cubestore/cubestore/src/cachestore/queue_active_counters.rs` (on `cubestore-queue-sharding` branch only) | `QueueActiveCounters` — the pattern to mirror for Option A |
+| `rust/cubestore/cubestore/src/metastore/mod.rs` | `meta_store_merge`, `RocksMetaStoreDetails::open_db` (the merge-operator precedent Option B's own operator mirrors) |
+| `rust/cubestore/cubestore/src/cachestore/queue_active_counters.rs` (on `cubestore-queue-sharding` branch only) | `QueueActiveCounters` — the pattern Option A (§10, superseded) mirrored |
 | `rust/cubestore/cubestore/benches/cachestore_queue_production_repro.rs` | The repro/validation benchmark (already on this branch) |
 | `packages/cubejs-query-orchestrator/src/orchestrator/QueryCache.ts`, `PreAggregations.ts` | Queue prefix construction (§1a) |
 | `packages/cubejs-query-orchestrator/src/orchestrator/QueryQueue.ts` | `queueSize`/`toProcessLimit` client-side consumers (§6) |
@@ -535,3 +551,157 @@ complementary and additive, not overlapping: this branch fixes a real algorithmi
 call; the sharding branch fixes cross-item thread contention for unrelated queue operations. A
 deployment hitting both symptoms (heartbeat/ack delay from thread contention, *and* pickup-latency
 degradation from Pending backlog) would want both.
+
+## 12. Option B Implementation (supersedes Option A)
+
+Option A (§10) worked and was fully benchmarked (§11), but was then replaced by Option B -- a
+RocksDB merge-operator-backed counter -- to get the more durable, harder-to-drift design §5
+originally described, rather than settle for the pragmatic-but-more-fragile in-memory version.
+
+**`QueuePendingCounters`** (`cachestore/queue_pending_counters.rs`, same file, rewritten) is now a
+zero-field unit struct -- all state lives in RocksDB itself, not in process memory:
+
+- **Key encoding**: each prefix's count is a raw key `[0xFE] ++ prefix_bytes`. The `0xFE` leading
+  tag is chosen to never collide with `RowKey::to_bytes()` (`metastore/rocks_store.rs`), whose only
+  defined leading bytes are `1..=5`.
+- **`increment(batch: &mut WriteBatch, prefix)`** / **`decrement(...)`**: queue a `+1`/`-1` merge
+  operand (i64, big-endian) into the **same** `WriteBatch` as the real queue-item mutation --
+  `queue_add`'s insert, `queue_retrieve_by_path`'s status update, `queue_cancel`'s delete. This is
+  the concrete "harder to forget" property Option B has over Option A: the counter update cannot be
+  committed without the state transition it tracks, or vice versa, because they're one atomic
+  RocksDB write.
+- **`get_count(snapshot: &Snapshot, prefix)`**: a plain `snapshot.get(key)` -- RocksDB itself
+  resolves any not-yet-compacted merge operands against the base value at read time, standard
+  behavior for `set_merge_operator_associative`.
+- **`reset_all(batch: &mut WriteBatch)`**: a `delete_range` over the whole `0xFE` key range, called
+  by `queue_truncate` (in the same batch as the table wipe) since these keys live outside the
+  `queue_item` table's own `RowKey` space and wouldn't otherwise be cleared by it.
+- **The merge function** (`queue_pending_count_merge`, associative, registered via
+  `set_merge_operator_associative` on both `RocksCacheStoreDetails::open_db` and
+  `open_readonly_db`): sums the existing value and all pending i64 operands, clamping the result at
+  a 0 floor. Mirrors the existing `meta_store_merge` precedent in `metastore/mod.rs` (registered
+  there but with zero real callers today), except that one is unsigned/add-only -- this one needed
+  signed deltas to support decrement.
+- **Compaction filter**: `MetaStoreCacheCompactionFilter::filter` (`cachestore/compaction.rs`) now
+  allow-lists the `0xFE` tag before its `RowKey::try_from_bytes` parse, so it doesn't log a spurious
+  "unable to read key" error for every one of these entries on every compaction pass.
+
+**Call-site changes from Option A** (`cache_rocksstore.rs`): every site now reads the pre-mutation
+count via `get_count(db_ref.snapshot, ...)`, computes the response's post-mutation value itself
+(`pending + 1` / `pending.saturating_sub(1)`) exactly the way the *original* pre-fix scan-based code
+already did, and separately queues the real `increment`/`decrement` merge into the batch -- because,
+unlike Option A's synchronous atomic, the merge isn't resolved into ground truth until the batch
+commits. The startup `rebuild_queue_pending_counters` step and its call in `spawn_processing_loops`
+are gone entirely -- there is nothing to rebuild; the value is already correct the moment the
+database is open.
+
+**New test**: `test_queue_pending_counters_persist_across_restart` -- adds items, retrieves one,
+asserts the count, then **drops the `RocksCacheStore` and reopens a fresh one at the same on-disk
+path** (via the existing `prepare_test_cachestore_impl` helper, called a second time without the
+delete-existing-directory step `prepare_test_cachestore` normally does first), and asserts the
+counter is immediately correct -- with no rebuild call anywhere. This is the concrete, directly
+tested behavioral difference from Option A that motivated the switch.
+`test_queue_pending_counters_match_ground_truth_after_churn` was kept (same churn scenario as
+Option A) but simplified: no more "assert before rebuild, then again after rebuild" -- there's only
+one thing to assert now, since the value is always live.
+
+**Known, documented limitation** (not fixed by this change, see the module's doc comment):
+`RocksStore::run_upload`'s incremental per-write log-shipping path (gated behind
+`CUBESTORE_CACHESTORE_LOG_ENABLED`, **default `false`**) iterates each committed `WriteBatch` via
+the `WriteBatchIterator` trait from the underlying `rust-rocksdb` binding used in this fork, which
+exposes only `put`/`delete` callbacks -- no `merge` hook exists in that trait at all. That means
+this specific replication path silently does not carry merge records to a follower. A periodic full
+RocksDB checkpoint (`upload_check_point`) is unaffected, since it copies the actual on-disk SST/WAL
+files, which already contain fully-resolved state regardless of how it got there. Per §6's
+drift-safety analysis (this counter never gates a correctness decision anywhere), the worst-case
+impact of this gap is a stale number in a log line on a follower replica that both (a) has that
+non-default flag enabled and (b) never resyncs from a checkpoint -- not a functional bug, but a
+real gap this implementation does not close. Flagged here rather than silently accepted.
+
+**Verification**: full `cargo test -p cubestore --lib` (203 tests -- net -1 vs. Option A's 204: -2
+for removing Option A's now-inapplicable atomic-specific unit tests, +1 for the new restart test),
+`cargo check -p cubestore --lib --tests`, and `cargo fmt --check` all clean, zero warnings, on both
+the library and this file's own changes.
+
+## 13. Three-Way Benchmark Comparison (No Optimization / Option A / Option B)
+
+Same methodology as §11 (two release binaries built from the exact same benchmark source, run
+back-to-back on the same idle machine, same session), extended to three: the pre-fix commit
+(`a18852ed6`), the Option A commit, and the current Option B `HEAD`. All three binaries share the
+identical `cachestore_queue_production_repro.rs` file (including the p75/p95 percentiles added in
+this round), copied across the three temporary worktrees used to build them, so any difference in
+output is attributable only to the cachestore implementation, not the benchmark harness.
+
+### PODS=40 (2x demand/capacity -- sanity check, single run each)
+
+| | Throughput | p50 | p75 | p90 | p95 | p99 | max |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| No optimization | 40.00/s | 1.85ms | 2.35ms | 2.88ms | 3.14ms | 3.64ms | 3.79ms |
+| Option A | 40.00/s | 1.74ms | 3.40ms | 4.12ms | 5.40ms | 8.21ms | 8.42ms |
+| Option B | 40.00/s | 1.56ms | 3.63ms | 4.77ms | 5.89ms | 6.84ms | 6.97ms |
+
+All flat and fast, no cascade in any of the three -- as expected, well below any threshold. The
+small spread between arms here is ordinary scheduler noise at sub-10ms scale, not a meaningful
+difference.
+
+### PODS=500 (25x demand/capacity, single run each)
+
+| | Throughput | p50 | p75 | p90 | p95 | p99 | max |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| No optimization | 40.00/s | 1.78ms | 8,181ms | 11,786ms | 12,812ms | 13,332ms | 13,841ms |
+| Option A | 40.00/s | 1.26ms | 1.61ms | 1.92ms | 2.19ms | 12,299ms | 13,336ms |
+| Option B | 40.00/s | 0.69ms | 3.09ms | 8,177ms | 10,235ms | 11,798ms | 13,328ms |
+
+At this load, all three single runs happened to keep aggregate throughput at the 40/s ceiling, but
+all three also show a tail cascade -- just kicking in at a different percentile each time (as low
+as p75 for "no optimization", as high as p99 for Option A). Given the bistable behavior documented
+in §3/§11 and reconfirmed below, don't read meaning into exactly *which* percentile the cascade
+starts at in a single run -- the more reliable signal is p50, which is uniformly sub-2ms for all
+three at this load.
+
+### PODS=1000 (50x demand/capacity -- the headline scenario, 3 runs per arm)
+
+Given pronounced bistability observed even within this session (see below), this scenario was run
+**three times per arm** rather than once, specifically to avoid presenting a single lucky-or-unlucky
+sample as if it were deterministic.
+
+| Arm | Run | Throughput | p50 | p99 | max |
+| --- | --- | --- | --- | --- | --- |
+| No optimization | 1 | 40.00/s | 16,558ms | 26,836ms | 27,363ms |
+| No optimization | 2 | 37.00/s | 12,961ms | 26,945ms | 27,473ms |
+| No optimization | 3 | 35.33/s | 12,526ms | 27,254ms | 27,375ms |
+| Option A | 1 | 40.00/s | 0.63ms | 1.21ms | 1.24ms |
+| Option A | 2 | 40.00/s | 1.30ms | 5.43ms | 5.46ms |
+| Option A | 3 | 40.00/s | 0.46ms | 25,594ms | 26,101ms |
+| Option B | 1 | 40.00/s | 0.70ms | 21,434ms | 24,576ms |
+| Option B | 2 | 40.00/s | 1.44ms | 2.01ms | 2.03ms |
+| Option B | 3 | 40.00/s | 0.60ms | 24,600ms | 25,116ms |
+
+**What's consistent across all 3 runs, both fixed arms:**
+
+- **Throughput never degrades**: 40.00/s in all 6 Option A/B runs, matching the theoretical
+  capacity ceiling exactly. "No optimization" degrades in 2 of 3 runs (35.33-37.00/s), direct
+  repeated evidence the O(n) scan consumes real throughput, not just adds latency.
+- **p50 is reliably sub-1.5ms** in all 6 Option A/B runs (range 0.46-1.44ms) vs. **12,500-16,600ms
+  in all 3 "no optimization" runs** -- a 4-5 order of magnitude difference that holds up across
+  repeated trials, not a one-off.
+
+**What does *not* reliably change between Option A and Option B:** tail latency at this specific
+50x overload ratio is genuinely bistable for *both* fixed arms -- Option A cascades in its tail on
+1 of 3 runs, Option B on 2 of 3 (too small a sample to treat as a real rate difference between A and
+B; both are consistent with "sometimes yes, sometimes no" at this load). "No optimization" cascades
+in its tail on 3 of 3 runs, every time. This matches the §11 conclusion and sharpens it: **neither
+counter implementation choice affects whether the tail cascade happens at 50x demand/capacity** --
+once backlog crosses roughly the threshold documented in §3, some run of the dice in exact task
+interleaving determines whether a handful of the last-admitted items get caught behind a genuine
+capacity-bound queueing delay (~980 items / 40/s ≈ 24.5s, matching every cascading run's max within
+a few percent). Both A and B eliminate the *scan-cost-driven* throughput tax and fix the *typical*
+case; neither was ever going to fix pure queueing math at extreme overload, and neither does.
+
+### Conclusion
+
+Pick Option A vs. Option B based on the tradeoffs in §5/§12 (durability and discipline-by-batching
+vs. implementation simplicity) -- **not** based on any difference in these benchmark numbers, since
+none of the three arms' measurements point at a meaningful performance difference between A and B.
+The real, load-bearing performance difference in this data is fixed-vs-unfixed (either A or B vs.
+no optimization), not A-vs-B.
