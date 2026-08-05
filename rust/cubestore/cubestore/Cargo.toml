@@ -143,6 +143,10 @@ name = "cachestore_queue_pickup_latency"
 harness = false
 
 [[bench]]
+name = "cachestore_queue_production_repro"
+harness = false
+
+[[bench]]
 name = "metastore"
 harness = false
 

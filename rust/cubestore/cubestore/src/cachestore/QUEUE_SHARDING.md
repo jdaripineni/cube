@@ -1309,7 +1309,7 @@ noise-level non-improvement in) the "many pods simultaneously fighting to retrie
 queue" mechanism -- and a production validation on real infrastructure, not just this laptop, is
 still needed before concluding it resolves the full 3-30s symptom.**
 
-### Repeatable Commands
+### Repeatable Commands (Experiments 1 and 2)
 
 **Experiment 1 (background-noise vs. pickup latency)**:
 
@@ -1352,6 +1352,391 @@ for PODS in 100 250 500 1000; do
   done
 done
 ```
+
+---
+
+## Production Incident Repro: ~40 Pods, Shared Prefix, Realistic Concurrency Limits
+
+A production report described intermittent query queue-wait (pickup) latency **spikes** up to
+30 seconds against a ~40-pod Cube.js deployment, ~300 cubes/data models, query concurrency
+configured somewhere in the 10-50+ range (exact value unknown), typical query execution
+sub-second to ~2s. This section builds a new benchmark specifically to reproduce and diagnose
+that symptom, because both benchmarks above have a gap that matters for it: neither models
+realistic query hold/execution time (items are ack'd near-immediately after retrieve), and
+neither uses a realistic, finite `allow_concurrency` (both pass a value large enough that
+admission blocking essentially never triggers). Without hold time, `Active` count for a prefix
+never sustains meaningful size; without a finite concurrency limit, admission blocking
+(`QueueRetrieveResponse::NotEnoughConcurrency`) never happens at all -- both are central to how
+production actually behaves.
+
+### Recap of the two established facts this builds on
+
+1. **Cube identity never enters the CubeStore queue key.** The prefix is built from
+   `(orchestratorId, dataSource)` only (`SQL_QUERY_<orchestratorId>_<dataSource>` /
+   `SQL_PRE_AGGREGATIONS_<orchestratorId>_<dataSource>`, see
+   `packages/cubejs-query-orchestrator/src/orchestrator/QueryCache.ts` and
+   `PreAggregations.ts`), so a typical single-tenant/single-datasource deployment funnels
+   through one (or two, counting pre-aggregations separately) shared CubeStore queue prefix
+   regardless of cube count. This is why the repro below uses **one shared prefix**, matching
+   Scenario A / Experiment 2 above, not the multi-prefix Scenario B.
+2. **`queue_retrieve_by_path` scans the entire prefix's item lists on every single call**,
+   guarded by a per-prefix `retrieve_lock` that fully serializes RETRIEVE-vs-RETRIEVE for a
+   prefix regardless of `CUBESTORE_QUEUE_RW_WORKERS` (`cache_rocksstore.rs`,
+   `queue_retrieve_by_path`; see "No Dirty Reads" §4 and "Surprise finding" above for where this
+   is already documented). Reading the function directly for this task surfaced a **refinement**
+   worth calling out explicitly: the function does two separate index scans on *every* call
+   (both the fast-path `NotEnoughConcurrency` check and the actual write path) --
+   `count_rows_by_index(ByPrefixAndStatus(prefix, Pending))` and
+   `get_rows_by_index(ByPrefixAndStatus(prefix, Active))`. Both bottom out in
+   `get_row_ids_by_index` (`rocks_table.rs`), which iterates the RocksDB secondary index range
+   for that `(prefix, status)` key -- i.e. genuinely `O(matching row count)`, not O(1). The
+   **Active** list is bounded by `allow_concurrency` by construction (the code explicitly never
+   lets `active.len()` exceed the limit), so its scan cost is capped at a constant for a fixed
+   `allow_concurrency`. The **Pending** count, however, is *not* bounded by anything -- it grows
+   without limit as backlog builds whenever arrival rate exceeds drain rate. This means the
+   *primary* engine of the feedback loop hypothesized in the original task framing is more
+   precisely: growing **Pending backlog** (not Active count) makes every subsequent retrieve
+   call more expensive (via the Pending-count scan), which slows the rate at which backlog
+   drains, which lets more items pile up -- with the bounded Active-list scan contributing a
+   fixed additive cost on top that shifts (but doesn't drive) the exact threshold. See "What the
+   sweep shows" below for the empirical confirmation and how `allow_concurrency` modulates that
+   additive cost.
+
+### The new benchmark
+
+`benches/cachestore_queue_production_repro.rs` (`harness = false`, registered in `Cargo.toml`
+the same way as the other two). Design:
+
+- **One shared prefix** (`PROD#shared`) for all traffic.
+- **`PODS` concurrent "pod" tasks**, each looping continuously for the run duration: `queue_add`
+  a uniquely-pathed new item -> retry `queue_retrieve_by_path` (with a finite
+  `ALLOW_CONCURRENCY`) every `POLL_INTERVAL_MS` until `Success` -> hold the item `Active` for
+  `HOLD_MS` (`tokio::time::sleep`, standing in for real warehouse query execution time) ->
+  `queue_ack`. This is a **closed-loop** demand model (a fixed population of concurrent
+  submitters, each doing one full cycle at a time), which is the right model for "N concurrent
+  in-flight queries", as opposed to an open-loop fixed arrival rate.
+- **Pickup latency** = wall-clock from the start of `queue_add` to the moment
+  `queue_retrieve_by_path` returns `Success` for that same path, including all failed-retry
+  polling in between -- literally "time from submission to being picked up," what the reported
+  3-30s symptom is about.
+- Samples are only recorded for cycles that *start* after `WARMUP_MS` has elapsed (steady-state
+  only).
+- A background **monitor task** samples the prefix's current Active and Pending item counts
+  every `ACTIVE_SAMPLE_INTERVAL_MS` via `queue_list` (a direct snapshot read, bypassing the RW
+  loop/retrieve_lock) -- this is what lets the tables below show backlog growth directly,
+  testing the feedback-loop hypothesis head-on.
+- A **hard safety timeout** (`HARD_TIMEOUT_GRACE_MS` past the nominal run end) force-stops the
+  benchmark and reports whatever samples completed if some pods are still stuck retrying --
+  otherwise a genuine cascade could make the benchmark hang indefinitely. Whenever a table below
+  reports `hard_timeout=true`, the `p90`/`p99`/`max` figures in that row are **right-censored at
+  the grace boundary** (`WARMUP_MS + RUN_MS + HARD_TIMEOUT_GRACE_MS` from start) -- the true tail
+  could be worse than shown. The dedicated "uncensored tail" runs further below use a much larger
+  grace window specifically to get past this artifact.
+- `POLL_INTERVAL_MS=100` was used throughout (within the task's suggested 50-200ms range): the
+  real Cube.js client uses a longer blocking-wait + reconcile pattern with a default 5s
+  `continueWaitTimeout`, but a shorter interval here is more conservative/revealing for finding
+  the contention mechanism itself (it generates more retrieve attempts per unit time, not fewer).
+
+Reproduction (single run):
+
+```sh
+cd rust/cubestore
+cargo build -p cubestore --release --bench cachestore_queue_production_repro
+find target/release/deps -maxdepth 1 -iname 'cachestore_queue_production_repro-*' -perm -u+x -type f
+cd cubestore
+BIN=../target/release/deps/cachestore_queue_production_repro-<hash>
+
+rm -rf db-tmp/benchmarks/cachestore_queue_production_repro_bench_w1
+CUBESTORE_QUEUE_RW_WORKERS=1 PODS=800 HOLD_MS=500 ALLOW_CONCURRENCY=20 \
+  RUN_MS=3000 WARMUP_MS=300 HARD_TIMEOUT_GRACE_MS=5000 "$BIN"
+```
+
+### Sweep 1: locating the threshold (`HOLD_MS=500`, `ALLOW_CONCURRENCY=20`, i.e. theoretical max throughput `C/(H/1000) = 40 items/sec`)
+
+`RUN_MS=3000, WARMUP_MS=300, HARD_TIMEOUT_GRACE_MS=5000, POLL_INTERVAL_MS=100` throughout.
+
+| PODS | demand ratio (PODS/C) | Workers | throughput (items/s) | p50 (ms) | p90 (ms) | p99 (ms) | max (ms) | n | pending_max | hard_timeout |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 10 | 0.5x | 1 | 20.00 | 0.425 | 12.148 | 14.133 | 14.148 | 60 | 7 | false |
+| 20 | 1.0x | 1 | 40.00 | 1.252 | 2.224 | 4.209 | 4.278 | 120 | 6 | false |
+| 40 | 2.0x | 1 | 40.00 | 1.798 | 4.277 | 6.489 | 6.588 | 120 | 30 | false |
+| 100 | 5.0x | 1 | 40.00 | 2.383 | 3.280 | 5.756 | 5.768 | 120 | 89 | false |
+| 250 | 12.5x | 1 | 40.00 | 1.414 | 2.075 | 2.399 | 2.448 | 120 | 230 | true |
+| 500 | 25.0x | 1 | 40.00 | 1.172 | 1.856 | 2.800 | 2.922 | 120 | 480 | true |
+| 1000 | 50.0x | 1 | 8.67 | 4016.292 | 6020.187 | 7023.758 | 7023.758 | 26 | 980 | true |
+| 2000 | 100.0x | 1 | 17.00 | 3007.306 | 7022.647 | 7516.002 | 7516.002 | 51 | 1980 | true |
+| 10 | 0.5x | 8 | 20.00 | 0.586 | 2.023 | 2.666 | 2.800 | 60 | 4 | false |
+| 20 | 1.0x | 8 | 40.00 | 1.169 | 2.923 | 4.866 | 4.939 | 120 | 7 | false |
+| 40 | 2.0x | 8 | 40.00 | 1.414 | 3.340 | 5.497 | 5.578 | 120 | 27 | false |
+| 100 | 5.0x | 8 | 40.00 | 2.178 | 4.517 | 5.540 | 5.652 | 120 | 88 | false |
+| 250 | 12.5x | 8 | 40.00 | 0.636 | 1.524 | 2.222 | 2.259 | 120 | 230 | true |
+| 500 | 25.0x | 8 | 40.00 | 1.018 | 2.020 | 2.503 | 2.617 | 120 | 480 | true |
+| 1000 | 50.0x | 8 | 11.00 | 4518.703 | 6016.887 | 6521.669 | 6521.669 | 33 | 980 | true |
+| 2000 | 100.0x | 8 | 7.67 | 5515.384 | 6527.702 | 7027.987 | 7027.987 | 23 | 1980 | true |
+
+A dramatic, non-linear jump appears between `PODS=500` (still sub-3ms across every percentile)
+and `PODS=1000` (p50 jumps to **~4-4.5 seconds**, p99 to ~7s) -- at **both** shard counts, with no
+meaningful difference between them. `hard_timeout=true` from `PODS=250` up is about the
+*post-run drain-down* not finishing within the grace window (pods stop submitting *new* items at
+`run_deadline` but already-submitted ones keep retrying) -- it does not by itself mean the
+*reported* samples are compromised at the lower rows; it only becomes a right-censoring concern
+once the reported latencies themselves approach the grace boundary (`PODS>=1000` rows).
+
+### Sweep 2: fine-grained threshold localization (same `H=500, C=20`)
+
+| PODS | Workers | throughput | p50 (ms) | p90 (ms) | p99 (ms) | max (ms) | n | pending_max |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 550 | 1 | 34.33 | 1.335 | 1.978 | 2.580 | 2.734 | 103 | 530 |
+| 600 | 1 | 29.67 | 1.352 | 2.273 | 2.857 | 2.970 | 89 | 580 |
+| 650 | 1 | 24.00 | 1.460 | 2.675 | 2.930 | 2.965 | 72 | 630 |
+| 700 | 1 | 24.33 | 1.367 | 4513.406 | 6517.998 | 6519.116 | 73 | 685 |
+| 750 | 1 | 22.00 | 3.028 | 7018.930 | 7021.327 | 7022.564 | 66 | 730 |
+| 800 | 1 | 15.00 | 3.383 | 4011.349 | 7516.228 | 7516.228 | 45 | 785 |
+| 850 | 1 | 9.33 | 3013.771 | 5519.861 | 7515.996 | 7515.996 | 28 | 830 |
+| 900 | 1 | 11.67 | 2004.235 | 6014.259 | 7526.878 | 7526.878 | 35 | 880 |
+| 950 | 1 | 15.33 | 4516.798 | 5518.096 | 6520.246 | 6520.246 | 46 | 930 |
+| 550 | 8 | 29.33 | 1.434 | 3564.702 | 4580.706 | 4580.707 | 88 | 530 |
+| 600 | 8 | 24.33 | 1.222 | 2.222 | 2.770 | 2.790 | 73 | 580 |
+| 650 | 8 | 24.33 | 1.410 | 1.956 | 2.594 | 2.716 | 73 | 630 |
+| 700 | 8 | 17.00 | 1.442 | 2.991 | 3.540 | 3.540 | 51 | 680 |
+| 750 | 8 | 26.67 | 1.906 | 6014.777 | 6021.299 | 6524.087 | 80 | 730 |
+| 800 | 8 | 18.00 | 3.025 | 4019.716 | 8026.282 | 8028.814 | 54 | 780 |
+| 850 | 8 | 11.33 | 3510.871 | 7521.913 | 8024.661 | 8024.661 | 34 | 830 |
+| 900 | 8 | 7.67 | 3509.319 | 6019.921 | 6508.052 | 6508.052 | 23 | 880 |
+| 950 | 8 | 15.67 | 3508.603 | 5011.318 | 5519.392 | 5519.392 | 47 | 930 |
+
+The onset is sharp and, notably, **not a uniform shift of the whole distribution** -- at the
+crossover (`PODS~650-750`) p50 often stays low (sub-2ms, most items still get lucky quickly)
+while p90/p99 jump straight to multi-second territory. That is a **bimodal** pattern (most
+requests fine, a growing minority stuck for seconds), which matches the reported "spikes,
+not a constant baseline" symptom far better than a smooth latency-vs-load curve would.
+
+### Sweep 2b: is the threshold crossing reproducible, or noise? (3 reruns each)
+
+`PODS in {650, 700, 750}`, `H=500, C=20`, same run parameters, 3 independent runs per
+`(PODS, workers)` combination:
+
+| PODS | Workers | Run 1 p90/p99 (ms) | Run 2 p90/p99 (ms) | Run 3 p90/p99 (ms) |
+| --- | --- | --- | --- | --- |
+| 650 | 1 | 6014.4 / 6519.6 (cascading) | 2.24 / 2.57 (clean) | 2.45 / 2.65 (clean) |
+| 700 | 1 | 6016.6 / 6533.2 (cascading) | 2.88 / 3.54 (clean) | 3.43 / 3.89 (clean) |
+| 750 | 1 | 6011.6 / 6019.6 (cascading) | 6519.6 / 7021.4 (cascading) | 6516.4 / 7020.3 (cascading) |
+| 650 | 8 | 3.19 / 6518.3 (tail only) | 2.78 / 3.27 (clean) | 3.12 / 3.36 (clean) |
+| 700 | 8 | 3.19 / 5512.0 (tail only) | 6016.4 / 6518.4 (cascading) | 2.38 / 2.97 (clean, max=5556) |
+| 750 | 8 | 6520.7 / 7024.8 (cascading) | 6519.6 / 7021.4 (cascading) | p50=3010.8, 6520.7 / 6528.4 (cascading) |
+
+**This confirms the crossover is a genuine metastable/bistable region, not measurement noise
+smoothing over a clean step function**: at 650-700 pods, whether a *given run* tips into cascade
+or stays clean varies run to run (both outcomes observed repeatedly at both shard counts); by
+750 pods, every single run (6/6 across both shard counts) cascades. This is arguably the most
+production-relevant finding in this section -- it is a textbook description of intermittent
+*spikes* rather than a deterministic threshold, because a system sitting near this capacity edge
+can tip into a runaway retrieve-lock cascade or not depending on essentially random scheduling
+fluctuations. It also reconfirms, across 18 additional paired runs, that **shard count does not
+move where this crossover happens** -- workers=1 and workers=8 cascade at the same `PODS` range,
+with no reliable ordering between them in either direction (also see the `H=200, PODS=700` reruns
+below, where an earlier apparent "workers=8 is worse" result reverted to "same as workers=1" on
+repeat -- consistent with this document's existing precedent that isolated results in the noisy
+bistable region are not to be over-interpreted, see Experiment 2's own honesty note above).
+
+### Sweep 3: does `HOLD_MS` shift the threshold? (`ALLOW_CONCURRENCY=20` fixed, `PODS` bracketing the `H=500` crossover found above)
+
+| PODS | HOLD_MS | Workers | throughput | p50 (ms) | p90 (ms) | p99 (ms) | max (ms) | n | pending_max |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 600 | 200 | 1 | 100.00 | 1.135 | 1.703 | 2.080 | 3262.980 | 300 | 580 |
+| 700 | 200 | 1 | 78.33 | 1.838 | 4107.479 | 5444.687 | 5447.771 | 235 | 681 |
+| 800 | 200 | 1 | 74.67 | 3211.141 | 6236.337 | 7309.882 | 7643.789 | 224 | 781 |
+| 900 | 200 | 1 | 66.33 | 3227.768 | 5441.269 | 7031.142 | 8056.294 | 199 | 881 |
+| 600 | 1000 | 1 | 14.33 | 1.246 | 2.249 | 2.681 | 2.681 | 43 | 580 |
+| 700 | 1000 | 1 | 9.33 | 1.390 | 3.680 | 3.905 | 3.905 | 28 | 680 |
+| 800 | 1000 | 1 | 5.67 | 3.277 | 5008.042 | 6011.853 | 6011.853 | 17 | 780 |
+| 900 | 1000 | 1 | 0.67 | 5006.783 | 5006.783 | 5006.783 | 5006.783 | 2 | 880 |
+| 600 | 2000 | 1 | 2.67 | 1.975 | 2.134 | 2.240 | 2.240 | 8 | 580 |
+| 700 | 2000 | 1 | 1.67 | 6016.030 | 6017.348 | 6017.348 | 6017.348 | 5 | 680 |
+| 800 | 2000 | 1 | 2.00 | 2.509 | 2.774 | 2.774 | 2.774 | 6 | 780 |
+| 900 | 2000 | 1 | 1.67 | 6004.950 | 6007.537 | 6007.537 | 6007.537 | 5 | 880 |
+| 600 | 200 | 8 | 100.00 | 1.096 | 1.769 | 2.292 | 204.128 | 300 | 580 |
+| 700 | 200 | 8 | 90.00 | 1421.795 | 6731.182 | 7446.502 | 7447.250 | 270 | 682 |
+| 800 | 200 | 8 | 74.00 | 2611.825 | 5633.696 | 6642.168 | 7472.062 | 222 | 780 |
+| 900 | 200 | 8 | 62.00 | 4013.130 | 5845.966 | 7473.584 | 8080.710 | 186 | 880 |
+| 600 | 1000 | 8 | 15.33 | 1.325 | 2.125 | 2.518 | 2.518 | 46 | 580 |
+| 700 | 1000 | 8 | 10.00 | 2.088 | 4008.018 | 5011.015 | 5011.015 | 30 | 680 |
+| 800 | 1000 | 8 | 6.33 | 2.463 | 6007.482 | 6012.097 | 6012.097 | 19 | 781 |
+| 900 | 1000 | 8 | 0.67 | 4007.422 | 4007.422 | 4007.422 | 4007.422 | 2 | 880 |
+| 600 | 2000 | 8 | 1.33 | 2.872 | 2.972 | 2.972 | 2.972 | 4 | 580 |
+| 700 | 2000 | 8 | 1.67 | 1.672 | 6018.027 | 6018.027 | 6018.027 | 5 | 680 |
+| 800 | 2000 | 8 | 1.33 | 3.438 | 3.582 | 3.582 | 3.582 | 4 | 780 |
+| 900 | 2000 | 8 | 0.00 | 0.000 | 0.000 | 0.000 | 0.000 | 0 | 880 |
+
+**Confirmatory reruns** (`H=200, PODS=700, C=20`, 2 more independent runs per shard count, to
+check the one apparently-anomalous `workers=8` row above where p50 was already 1421.8ms):
+
+| Run | Workers | p50 (ms) | p90 (ms) |
+| --- | --- | --- | --- |
+| 1 | 1 | 2.576 | 6230.787 |
+| 1 | 8 | 205.823 | 6329.223 |
+| 2 | 1 | 2.479 | 4913.130 |
+| 2 | 8 | 2.739 | 5921.275 |
+
+**What this shows**: the crossover point (in terms of `PODS`, i.e. absolute Pending backlog size,
+since backlog `~= PODS - C` once saturated) is **essentially the same regardless of `HOLD_MS`**
+(clean at 600, cascading somewhere in the 700-900 range, at `H` = 200, 500, 1000, and 2000 alike).
+This is consistent with the mechanism identified above: the poll-driven retrieve-attempt rate is
+`(PODS - C) / POLL_INTERVAL_MS`, independent of `H`; `H` mainly controls how fast admitted slots
+free up (and therefore the *absolute* pickup latency once cascading, and how many samples fit in
+a fixed `RUN_MS` window), not whether the Pending-scan cost crosses the point where the
+per-prefix lock saturates. The one apparently-anomalous `workers=8` reading (`H=200, PODS=700,
+p50=1421.8ms`) reverted to a normal, low value on both reruns above -- another instance of noise
+in the bistable crossover region (see Sweep 2b), not a systematic shard-count effect.
+
+### Sweep 4: does `ALLOW_CONCURRENCY` shift the threshold? (`HOLD_MS=500` fixed)
+
+| PODS | ALLOW_CONCURRENCY | Workers | throughput | p50 (ms) | p90 (ms) | p99 (ms) | max (ms) | n | pending_max |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 600 | 10 | 1 | 17.00 | 0.757 | 1.238 | 2.324 | 2.324 | 51 | 590 |
+| 700 | 10 | 1 | 12.33 | 1.016 | 1.437 | 1.683 | 1.683 | 37 | 690 |
+| 800 | 10 | 1 | 6.00 | 1.462 | 2.563 | 3011.836 | 3011.836 | 18 | 790 |
+| 900 | 10 | 1 | 3.00 | 3510.235 | 5515.693 | 6511.647 | 6511.647 | 9 | 890 |
+| 600 | 50 | 1 | 92.67 | 3514.225 | 5538.077 | 6657.512 | 7163.477 | 278 | 559 |
+| 700 | 50 | 1 | 86.00 | 2050.031 | 5009.431 | 6113.878 | 7567.335 | 258 | 650 |
+| 800 | 50 | 1 | 80.33 | 3520.082 | 6519.609 | 7052.980 | 7532.228 | 241 | 758 |
+| 900 | 50 | 1 | 77.33 | 4022.066 | 6023.708 | 7526.274 | 7530.444 | 232 | 850 |
+| 600 | 10 | 8 | 13.33 | 0.685 | 1.192 | 1.460 | 1.460 | 40 | 590 |
+| 700 | 10 | 8 | 13.33 | 0.753 | 1.355 | 2.139 | 2.139 | 40 | 690 |
+| 800 | 10 | 8 | 3.67 | 1.597 | 6514.354 | 6514.384 | 6514.384 | 11 | 790 |
+| 900 | 10 | 8 | 1.67 | 4514.501 | 6511.202 | 6511.202 | 6511.202 | 5 | 890 |
+| 600 | 50 | 8 | 99.67 | 5.738 | 5125.369 | 6677.719 | 6678.245 | 299 | 559 |
+| 700 | 50 | 8 | 80.67 | 3020.573 | 5538.072 | 7515.401 | 7522.601 | 242 | 664 |
+| 800 | 50 | 8 | 63.33 | 3512.122 | 5013.306 | 7520.112 | 7522.810 | 190 | 750 |
+| 900 | 50 | 8 | 69.00 | 2512.213 | 6524.656 | 8032.957 | 8035.503 | 207 | 850 |
+
+**This is the one axis where the threshold clearly does move, and the direction is
+counter-intuitive**: at `ALLOW_CONCURRENCY=10`, the system stays clean through `PODS=700`
+(backlog ~690) and only cascades by `PODS=900` (backlog ~890) -- a *higher* backlog tolerance
+than the `C=20` case. At `ALLOW_CONCURRENCY=50`, the system is **already fully cascading at
+PODS=600** (backlog only ~559) -- a *lower* backlog tolerance than `C=20`. In other words,
+**raising `allow_concurrency` makes this specific cascade trigger at a *smaller* backlog, not a
+larger one.** This matches the refined mechanism above: the Active-list scan is bounded by `C`
+but still costs something on every call, so a larger `C` adds more fixed per-call overhead before
+the unbounded Pending-count scan even starts growing -- shifting the point at which the
+combined per-call cost saturates the per-prefix lock to occur at a smaller Pending backlog. This
+is a genuine, non-obvious finding: naively "raise concurrency to relieve pressure" is not a clean
+win against *this specific* cascade mechanism, because it also raises the fixed cost of every
+future retrieve call. (It's still likely a net win for *overall admitted throughput* under
+moderate load, per the `C/(H/1000)` relationship in Sweep 1 -- the tradeoff is scenario-dependent
+and not something this benchmark alone can resolve; see Recommendations below.)
+
+### Uncensored tail: how bad does it actually get if allowed to fully play out?
+
+Every table above uses `HARD_TIMEOUT_GRACE_MS=5000`, which right-censors the worst rows (their
+`p90`/`p99`/`max` cluster near the grace boundary -- an artifact of the cutoff, not the true
+tail). To get an honest, *uncensored* read of the worst case, two points already known to be
+past the threshold were re-run with a much larger grace window (`60s` / `90s`) so the benchmark
+was allowed to fully drain naturally (`hard_timeout=false` in both cases below -- these are real,
+complete measurements, not cut off):
+
+| PODS | C | H | Workers | Wall-clock (s) | p50 (ms) | p90 (ms) | p99 (ms) | max (ms) | n |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 800 | 20 | 500 | 1 | 23.945 | 5510.389 | 18269.085 | 21385.915 | 22437.683 | 120 |
+| 800 | 20 | 500 | 8 | 23.928 | 4516.239 | 19362.011 | 21415.707 | 21415.711 | 120 |
+| 1000 | 20 | 500 | 1 | 28.773 | 16037.537 | 23181.254 | 25756.011 | 26761.680 | 120 |
+| 1000 | 20 | 500 | 8 | 28.830 | 16562.015 | 22690.912 | 26793.778 | 27324.926 | 120 |
+
+**This is the single most important result in this section.** Allowed to run uncensored, pickup
+latency at `PODS=1000` reaches **p99 = 25.8-26.8s, max = 26.8-27.3s** -- within the same order of
+magnitude as, and directly comparable to, the reported real-world "up to 30 seconds" symptom.
+This is a materially closer match than Experiments 1/2 above achieved (those topped out at
+hundreds of milliseconds, three orders of magnitude short of the 3-30s complaint) -- the
+difference is precisely the combination this section adds: realistic finite `allow_concurrency`
+plus realistic non-zero `HOLD_MS`, which together let a large, genuinely unbounded Pending
+backlog accumulate the way it plausibly does in production. **And once again, `workers=1` vs
+`workers=8` are statistically indistinguishable at both demand levels** (e.g. at `PODS=1000`:
+p99 25756ms vs 26794ms, max 26762ms vs 27325ms) -- decisive, repeated confirmation that
+`CUBESTORE_QUEUE_RW_WORKERS` has no effect on this specific cascade.
+
+### Important caveat: what "PODS" means here vs. "~40 Cube.js pods" in production
+
+The cascade in this section required `PODS` (concurrent submitting tasks in the closed-loop
+model) in the many-hundreds to trigger -- nowhere close to "40." This is **not** a claim that 40
+literal Cube.js pods themselves are insufficient to reproduce the symptom; it is a claim about
+**concurrently in-flight/pending distinct queries against the shared prefix**, which is a
+different quantity. A single Cube.js pod is a server process handling many simultaneous
+end-user/dashboard requests, each of which can independently submit its own item to the same
+shared CubeStore queue prefix (per established fact #1 above). With ~300 cubes/data models and
+query concurrency already configured to 10-50+, it is entirely plausible for a traffic burst
+across 40 pods to produce several hundred to low-thousands of concurrently-submitted distinct
+queries funneling through the one shared prefix at once -- which is exactly the "spike" framing
+in the original report (a transient burst, not a sustained baseline). This benchmark did **not**
+attempt to model pods-vs-requests-per-pod directly (that would require assumptions about
+per-pod HTTP concurrency this task has no data for); it isolates the CubeStore-side mechanism and
+shows what backlog size triggers it. Whether real 40-pod bursts actually reach that backlog size
+is a plausible, but not independently verified, extrapolation -- flagged honestly rather than
+asserted.
+
+### Verdict: Production Incident Repro
+
+**Was the cascade/threshold hypothesis confirmed?** Yes, clearly and reproducibly. Pickup latency
+stays flat (low single-digit milliseconds at p99) until a sharp, genuinely non-linear threshold,
+past which it jumps to multi-second, and eventually (uncensored) tens-of-seconds, latency. The
+threshold is a **bistable/metastable crossover** (Sweep 2b), not a clean deterministic step --
+which is a better match for "spikes" than a smooth degradation curve would be.
+
+**Where is the threshold?** In terms of absolute Pending backlog size (`~= PODS - allow_concurrency`
+once saturated), roughly **650-750 items at `allow_concurrency=20`**, moving to **~550-650 at
+`allow_concurrency=50`** and **~700-800+ at `allow_concurrency=10`** -- i.e., a *higher*
+`allow_concurrency` triggers the cascade at a *smaller* backlog (Sweep 4), while `HOLD_MS` has
+essentially no effect on where the threshold sits, only on the absolute latency and sample rate
+once past it (Sweep 3).
+
+**Does shard count (`CUBESTORE_QUEUE_RW_WORKERS`) affect this at all?** No. Across every sweep
+above (Sweep 1 through the uncensored tail, ~100 total runs), `workers=1` and `workers=8` cross
+the threshold at the same `PODS` range and reach the same order-of-magnitude latency once
+cascading, with no reliable ordering between them -- fully consistent with, and a strong
+additional confirmation of, this document's existing conclusion that the per-prefix
+`retrieve_lock` (and now, more precisely, the unbounded Pending-count scan it guards) is entirely
+orthogonal to `CUBESTORE_QUEUE_RW_WORKERS`. **Stage 1 alone does not, and structurally cannot,
+fix this production symptom.**
+
+### Recommendations
+
+Given what was actually found (not what was assumed going in):
+
+1. **Reduce the per-prefix retrieve scan cost -- new fix candidate, distinct from Stage 1/2.**
+   This is the most direct, targeted fix for *this specific* mechanism: the root cause is that
+   `queue_retrieve_by_path` re-derives the Pending count (and Active list) via a full RocksDB
+   index scan on *every* call while holding an exclusive per-prefix lock. An analogous fix to the
+   existing `QueueActiveCounters` (an atomic, incrementally-maintained counter instead of a
+   per-call scan) applied to the **Pending** count specifically would remove the unbounded part
+   of this cost entirely, independent of shard count. This is a genuine new finding from this
+   task, not something Stage 1 (sharding the RW loop) or Stage 2 (multiple routers) were ever
+   designed to address -- both leave the per-prefix lock and its O(backlog) scan fully intact.
+2. **Do not treat "raise `allow_concurrency`" as a clean fix.** Sweep 4 shows raising
+   `allow_concurrency` shifts this specific cascade's trigger point to a *smaller* Pending
+   backlog, not a larger one, because it raises the fixed per-call Active-list-scan cost. It may
+   still be worth raising for overall throughput reasons unrelated to this mechanism, but it is
+   not a substitute for #1 and should not be assumed to relieve backlog pressure -- verify with
+   this benchmark (or a real staging environment) before relying on it.
+3. **Splitting the shared prefix** (e.g. by pre-aggregation table, or some other dimension) would
+   directly reduce the backlog *per lock*, since the lock and scan are per-prefix. This is
+   architecturally non-trivial given established fact #1 (cube identity isn't in the queue key
+   today; this would require orchestrator/queue-key changes, similar in spirit to the Stage 2
+   "Multiple CubeStore Routers" direction already sketched above, or a lower-effort in-process
+   variant that shards *retrieve_lock/backlog* by some hash of the item path within one CubeStore
+   instance). This section does not design that change, only flags it as a viable direction
+   consistent with the data.
+4. **`CUBESTORE_QUEUE_RW_WORKERS` (Stage 1) should not be presented as fixing this specific
+   symptom.** It remains valuable for what it does fix (heartbeat/ack latency, per Experiment 1
+   and the original Benchmark Results above), but this section's data is unambiguous: it has no
+   measurable effect on the backlog-driven RETRIEVE cascade that most plausibly explains the
+   reported 3-30s spikes.
+5. **Confidence caveat**: like the rest of this document, all of the above comes from a single
+   local laptop process (Apple M4 Max, 14 logical cores, RocksDB on local SSD) -- see the
+   "Environment caveat" in the original Benchmark Results section. The uncensored `PODS=1000`
+   result reaching ~27s max is a striking, order-of-magnitude match to the reported 30s symptom,
+   but this is one local benchmark, not a production measurement; recommendation #1 (fixing the
+   scan cost) is offered with reasonable confidence given how directly it follows from the code
+   read in this section, but it has not been implemented or measured here -- it is a diagnosis
+   and a proposed direction, not a validated fix.
 
 ---
 
