@@ -883,11 +883,11 @@ impl RocksStoreRWLoop {
 pub struct RocksStore {
     pub db: Arc<DB>,
     pub config: Arc<dyn ConfigObj>,
-    seq_store: Arc<Mutex<HashMap<TableId, u64>>>,
+    pub seq_store: Arc<Mutex<HashMap<TableId, u64>>>,
     pub listeners: Arc<RwLock<Vec<Sender<MetaStoreEvent>>>>,
     metastore_fs: Arc<dyn MetaStoreFs>,
     last_checkpoint_time: Arc<RwLock<SystemTime>>,
-    write_notify: Arc<Notify>,
+    pub write_notify: Arc<Notify>,
     pub(crate) write_completed_notify: Arc<Notify>,
     last_upload_seq: Arc<RwLock<u64>>,
     last_check_seq: Arc<RwLock<u64>>,
@@ -951,6 +951,10 @@ impl RocksStore {
         };
 
         Ok(meta_store)
+    }
+
+    pub fn get_name(&self) -> &'static str {
+        self.details.get_name()
     }
 
     pub fn new(
