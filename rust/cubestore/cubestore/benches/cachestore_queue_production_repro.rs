@@ -372,7 +372,9 @@ fn main() {
 
     let n = pickup_samples.len();
     let p50 = percentile_sorted(&pickup_samples, 50.0);
+    let p75 = percentile_sorted(&pickup_samples, 75.0);
     let p90 = percentile_sorted(&pickup_samples, 90.0);
+    let p95 = percentile_sorted(&pickup_samples, 95.0);
     let p99 = percentile_sorted(&pickup_samples, 99.0);
     let max = pickup_samples.last().copied().unwrap_or(Duration::ZERO);
     let throughput = if run_ms > 0 {
@@ -405,15 +407,17 @@ fn main() {
     println!("pending backlog at end of run:                            {}", pending_end);
     println!();
     println!(
-        "{:<10} {:>10} {:>12} {:>12} {:>12} {:>12}",
-        "metric", "n", "p50 (ms)", "p90 (ms)", "p99 (ms)", "max (ms)"
+        "{:<10} {:>10} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+        "metric", "n", "p50 (ms)", "p75 (ms)", "p90 (ms)", "p95 (ms)", "p99 (ms)", "max (ms)"
     );
     println!(
-        "{:<10} {:>10} {:>12} {:>12} {:>12} {:>12}",
+        "{:<10} {:>10} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
         "pickup",
         n,
         fmt_ms(p50),
+        fmt_ms(p75),
         fmt_ms(p90),
+        fmt_ms(p95),
         fmt_ms(p99),
         fmt_ms(max)
     );
@@ -421,7 +425,7 @@ fn main() {
     // Single-line CSV-style summary for easy cross-run grepping/tabulation.
     println!();
     println!(
-        "SUMMARY,workers={},pods={},hold_ms={},concurrency={},poll_ms={},demand_ratio={:.2},throughput={:.2},p50_ms={:.3},p90_ms={:.3},p99_ms={:.3},max_ms={:.3},n={},active_max={},pending_max={},pending_end={},hard_timeout={}",
+        "SUMMARY,workers={},pods={},hold_ms={},concurrency={},poll_ms={},demand_ratio={:.2},throughput={:.2},p50_ms={:.3},p75_ms={:.3},p90_ms={:.3},p95_ms={:.3},p99_ms={:.3},max_ms={:.3},n={},active_max={},pending_max={},pending_end={},hard_timeout={}",
         workers,
         pods,
         hold_ms,
@@ -430,7 +434,9 @@ fn main() {
         pods as f64 / allow_concurrency as f64,
         throughput,
         p50.as_secs_f64() * 1000.0,
+        p75.as_secs_f64() * 1000.0,
         p90.as_secs_f64() * 1000.0,
+        p95.as_secs_f64() * 1000.0,
         p99.as_secs_f64() * 1000.0,
         max.as_secs_f64() * 1000.0,
         n,

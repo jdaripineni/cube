@@ -96,6 +96,10 @@ impl RocksStoreDetails for RocksCacheStoreDetails {
         opts.set_compaction_filter_factory(compaction::MetaStoreCacheCompactionFactory::new(
             compaction_state,
         ));
+        opts.set_merge_operator_associative(
+            "queue pending count merge",
+            crate::cachestore::queue_pending_counters::queue_pending_count_merge,
+        );
         // TODO(ovr): Decrease after additional fix for get_updates_since
         opts.set_wal_ttl_seconds(
             config.meta_store_snapshot_interval() + config.meta_store_log_upload_interval(),
@@ -133,6 +137,13 @@ impl RocksStoreDetails for RocksCacheStoreDetails {
         opts.set_prefix_extractor(cuberockstore::rocksdb::SliceTransform::create_fixed_prefix(
             13,
         ));
+        // Needed so reads through this handle correctly resolve any not-yet-compacted
+        // `QueuePendingCounters` merge operands (see that module's doc comment) instead of
+        // seeing only the last full value written.
+        opts.set_merge_operator_associative(
+            "queue pending count merge",
+            crate::cachestore::queue_pending_counters::queue_pending_count_merge,
+        );
 
         let block_opts = {
             let mut block_opts = BlockBasedOptions::default();
@@ -267,56 +278,24 @@ impl RocksCacheStore {
         self.cache_eviction_manager.run_eviction(&self.store).await
     }
 
-    /// Rebuild the in-memory pending queue counters from RocksDB state. Must be
-    /// called once at startup, before any queue operation is processed -- see
-    /// `PENDING_COUNT_SCAN_COST.md` for why this replaces a per-call RocksDB scan.
-    pub async fn rebuild_queue_pending_counters(&self) -> Result<(), CubeError> {
-        let prefix_counts = self
-            .read_operation_queue("rebuild_pending_counters", move |db_ref| {
-                let queue_schema = QueueItemRocksTable::new(db_ref.clone());
-                let mut counts: HashMap<String, u64> = HashMap::new();
-
-                let all_items = queue_schema.all_rows()?;
-                for item in all_items {
-                    if item.get_row().get_status() == &QueueItemStatus::Pending {
-                        let prefix = item.get_row().get_prefix().clone().unwrap_or_default();
-                        *counts.entry(prefix).or_insert(0) += 1;
-                    }
-                }
-
-                Ok(counts)
-            })
-            .await?;
-
-        let num_prefixes = prefix_counts.len();
-        self.queue_pending_counters.rebuild(prefix_counts);
-        log::info!(
-            "Rebuilt queue pending counters for {} prefixes",
-            num_prefixes
-        );
-        Ok(())
-    }
-
-    /// Test-only accessor for the in-memory pending-item counter of a prefix, so
-    /// tests can assert the atomic counter matches RocksDB ground truth without
-    /// exposing this internal state in production APIs.
+    /// Test-only accessor for the persisted pending-item counter of a prefix, so tests can
+    /// assert it matches RocksDB ground truth without exposing this internal state in
+    /// production APIs. No rebuild-at-startup step exists for this counter -- see
+    /// `PENDING_COUNT_SCAN_COST.md`'s "Option B" section: the value is persisted directly in
+    /// RocksDB via a merge operator, so it's already correct as soon as the database is open.
     #[cfg(test)]
-    pub fn queue_pending_count_for_test(&self, prefix: &str) -> u64 {
-        self.queue_pending_counters.get_count(prefix)
+    pub async fn queue_pending_count_for_test(&self, prefix: &str) -> u64 {
+        let queue_pending_counters = self.queue_pending_counters.clone();
+        let prefix = prefix.to_string();
+        self.read_operation_queue("queue_pending_count_for_test", move |db_ref| {
+            Ok(queue_pending_counters.get_count(db_ref.snapshot, &prefix))
+        })
+        .await
+        .unwrap_or(0)
     }
 
     pub fn spawn_processing_loops(self: Arc<Self>) -> Vec<JoinHandle<Result<(), CubeError>>> {
         let mut loops = vec![];
-
-        // Rebuild pending queue counters from RocksDB state before processing any
-        // other queue operations.
-        let cachestore_rebuild = self.clone();
-        loops.push(cube_ext::spawn(async move {
-            if let Err(e) = cachestore_rebuild.rebuild_queue_pending_counters().await {
-                log::error!("Failed to rebuild queue pending counters: {}", e);
-            }
-            Ok(())
-        }));
 
         if self.store.config.upload_to_remote() {
             let upload_interval = self.store.config.cachestore_log_upload_interval();
@@ -1227,7 +1206,7 @@ impl CacheStore for RocksCacheStore {
         self.write_operation_queue("queue_add", move |db_ref, batch_pipe| {
             let queue_schema = QueueItemRocksTable::new(db_ref.clone());
             let prefix = QueueItem::extract_prefix(payload.path.clone()).unwrap_or("".to_string());
-            let pending = queue_pending_counters.get_count(&prefix);
+            let pending = queue_pending_counters.get_count(db_ref.snapshot, &prefix);
 
             let index_key = QueueItemIndexKey::ByPath(payload.path.clone());
             let id_row_opt = queue_schema
@@ -1263,7 +1242,8 @@ impl CacheStore for RocksCacheStore {
             };
 
             let pending = if added {
-                queue_pending_counters.increment(&prefix)
+                queue_pending_counters.increment(batch_pipe.batch(), &prefix);
+                pending + 1
             } else {
                 pending
             };
@@ -1274,6 +1254,7 @@ impl CacheStore for RocksCacheStore {
     }
 
     async fn queue_truncate(&self) -> Result<(), CubeError> {
+        let queue_pending_counters = self.queue_pending_counters.clone();
         self.write_operation_queue("queue_truncate", move |db_ref, batch_pipe| {
             let queue_item_schema = QueueItemRocksTable::new(db_ref.clone());
             queue_item_schema.truncate(batch_pipe)?;
@@ -1284,13 +1265,14 @@ impl CacheStore for RocksCacheStore {
             let queue_result_schema = QueueResultRocksTable::new(db_ref);
             queue_result_schema.truncate(batch_pipe)?;
 
+            // The whole queue_item table is now empty -- reset every persisted pending
+            // counter in the same atomic batch rather than leaving stale per-prefix counts
+            // around.
+            queue_pending_counters.reset_all(batch_pipe.batch());
+
             Ok(())
         })
         .await?;
-
-        // The whole queue_item table is now empty -- reset every in-memory pending
-        // counter rather than leaving stale per-prefix counts around.
-        self.queue_pending_counters.rebuild(HashMap::new());
 
         Ok(())
     }
@@ -1417,7 +1399,7 @@ impl CacheStore for RocksCacheStore {
                 let queue_item = queue_schema.delete_row(id_row, batch_pipe)?;
 
                 if was_pending {
-                    queue_pending_counters.decrement(&prefix);
+                    queue_pending_counters.decrement(batch_pipe.batch(), &prefix);
                 }
 
                 if let Some(queue_payload) = queue_payload_schema.try_delete(row_id, batch_pipe)? {
@@ -1469,7 +1451,7 @@ impl CacheStore for RocksCacheStore {
             let prefix = QueueItem::parse_path(path.clone())
                 .0
                 .unwrap_or("".to_string());
-            let pending = queue_pending_counters.get_count(&prefix);
+            let pending = queue_pending_counters.get_count(db_ref.snapshot, &prefix);
 
             let mut active: Vec<String> = queue_schema
                 .get_rows_by_index(
@@ -1542,7 +1524,8 @@ impl CacheStore for RocksCacheStore {
                 };
 
                 active.push(res.get_row().get_key().clone());
-                let pending = queue_pending_counters.decrement(&prefix);
+                queue_pending_counters.decrement(batch_pipe.batch(), &prefix);
+                let pending = pending.saturating_sub(1);
                 Ok(QueueRetrieveResponse::Success {
                     id: id_row.get_id(),
                     payload,
@@ -2699,13 +2682,13 @@ mod tests {
             QueueRetrieveResponse::Success { pending, .. } => assert_eq!(pending, 1),
             other => panic!("expected Success, got {:?}", other),
         }
-        assert_eq!(cachestore.queue_pending_count_for_test(prefix), 1);
+        assert_eq!(cachestore.queue_pending_count_for_test(prefix).await, 1);
 
         // Cancelling "b" while still Pending drops the count to 0.
         cachestore
             .queue_cancel(QueueKey::ByPath(format!("{}:b", prefix)))
             .await?;
-        assert_eq!(cachestore.queue_pending_count_for_test(prefix), 0);
+        assert_eq!(cachestore.queue_pending_count_for_test(prefix).await, 0);
 
         RocksCacheStore::cleanup_test_cachestore("test_queue_pending_count_sequential");
 
@@ -2715,10 +2698,11 @@ mod tests {
     /// Concurrency/drift test analogous to the `cubestore-queue-sharding` branch's
     /// `test_queue_counters_match_ground_truth_after_churn`, adapted for the Pending
     /// counter this branch adds. Churns add/retrieve/cancel/ack concurrently across
-    /// several prefixes, then asserts the in-memory `QueuePendingCounters` value for
-    /// every prefix matches a fresh RocksDB scan (`queue_list` filtered to `Pending`)
-    /// both before and after an explicit `rebuild_queue_pending_counters` call -- i.e.
-    /// the counter never drifts from ground truth, and rebuilding it is a no-op.
+    /// several prefixes, then asserts the RocksDB-merge-operator-backed
+    /// `QueuePendingCounters` value for every prefix matches a fresh RocksDB scan
+    /// (`queue_list` filtered to `Pending`) -- i.e. the counter never drifts from ground
+    /// truth. Unlike an in-memory counter, there's no separate "rebuild" step to
+    /// additionally verify here: the value is always read live from RocksDB itself.
     #[tokio::test]
     async fn test_queue_pending_counters_match_ground_truth_after_churn() -> Result<(), CubeError> {
         init_test_logger().await;
@@ -2800,29 +2784,84 @@ mod tests {
             ground_truth.insert(prefix.clone(), pending_items.len() as u64);
         }
 
-        // Counter values BEFORE rebuild should already match ground truth (no drift from
-        // incremental maintenance in queue_add/queue_retrieve_by_path/queue_cancel).
+        // The persisted, merge-operator-backed counter must match ground truth for every
+        // prefix -- no drift from incremental maintenance in
+        // queue_add/queue_retrieve_by_path/queue_cancel.
         for prefix in &prefixes {
-            let counter_before = cachestore.queue_pending_count_for_test(prefix);
+            let counter = cachestore.queue_pending_count_for_test(prefix).await;
             assert_eq!(
-                counter_before, ground_truth[prefix],
-                "prefix {}: counter drifted from ground truth before rebuild (counter={}, ground_truth={})",
-                prefix, counter_before, ground_truth[prefix]
-            );
-        }
-
-        // Rebuild should be a no-op relative to ground truth.
-        cachestore.rebuild_queue_pending_counters().await?;
-        for prefix in &prefixes {
-            let counter_after = cachestore.queue_pending_count_for_test(prefix);
-            assert_eq!(
-                counter_after, ground_truth[prefix],
-                "prefix {}: counter mismatched ground truth after rebuild (counter={}, ground_truth={})",
-                prefix, counter_after, ground_truth[prefix]
+                counter, ground_truth[prefix],
+                "prefix {}: counter drifted from ground truth (counter={}, ground_truth={})",
+                prefix, counter, ground_truth[prefix]
             );
         }
 
         RocksCacheStore::cleanup_test_cachestore("test_queue_pending_counters_ground_truth");
+
+        Ok(())
+    }
+
+    /// Proves the core advantage of the RocksDB-merge-operator-backed `QueuePendingCounters`
+    /// (Option B) over the in-process atomic counter this branch shipped first (Option A): the
+    /// persisted count survives a process restart with **no rebuild-from-scan step**. Adds
+    /// items, drops the `RocksCacheStore` (releasing the RocksDB handle), reopens a fresh
+    /// `RocksCacheStore` pointed at the *same* on-disk path, and asserts the counter is
+    /// immediately correct -- before any queue operation has run against the reopened store.
+    #[tokio::test]
+    async fn test_queue_pending_counters_persist_across_restart() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        let test_name = "test_queue_pending_counters_persist_across_restart";
+        let store_path = env::current_dir()
+            .unwrap()
+            .join("db-tmp")
+            .join("tests")
+            .join(format!("{}-local", test_name));
+        let _ = std::fs::remove_dir_all(store_path.clone());
+        let prefix = "restart_prefix";
+
+        {
+            let (_, cachestore) = RocksCacheStore::prepare_test_cachestore_impl(
+                test_name,
+                store_path.clone(),
+                Config::test(test_name),
+            );
+
+            for i in 0..5 {
+                cachestore
+                    .queue_add(QueueAddPayload {
+                        path: format!("{}:item-{}", prefix, i),
+                        value: format!("value-{}", i),
+                        priority: 0,
+                        orphaned: None,
+                        process_id: None,
+                        exclusive: false,
+                        external_id: None,
+                    })
+                    .await?;
+            }
+            // Retrieve one item, so the persisted count must reflect a decrement too, not just
+            // accumulated increments.
+            cachestore
+                .queue_retrieve_by_path(format!("{}:item-0", prefix), 10, None)
+                .await?;
+
+            assert_eq!(cachestore.queue_pending_count_for_test(prefix).await, 4);
+
+            // `cachestore` (and the `Arc<RocksStore>`/`Arc<DB>` it owns) drops at the end of
+            // this block, closing the RocksDB handle before the reopen below.
+        }
+
+        let (_, reopened) = RocksCacheStore::prepare_test_cachestore_impl(
+            test_name,
+            store_path,
+            Config::test(test_name),
+        );
+
+        // No rebuild call of any kind here -- this is the point of the test.
+        assert_eq!(reopened.queue_pending_count_for_test(prefix).await, 4);
+
+        RocksCacheStore::cleanup_test_cachestore(test_name);
 
         Ok(())
     }

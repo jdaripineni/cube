@@ -188,6 +188,15 @@ impl CompactionFilter for MetaStoreCacheCompactionFilter {
     fn filter(&mut self, _level: u32, key: &[u8], value: &[u8]) -> CompactionDecision {
         self.scanned += 1;
 
+        // `QueuePendingCounters` keys live outside the `RowKey` space (see that module's doc
+        // comment): allow-list them here so `RowKey::try_from_bytes` below doesn't log a
+        // spurious "unable to read key" error for every one of them on every compaction pass.
+        if key.first()
+            == Some(&crate::cachestore::queue_pending_counters::QUEUE_PENDING_COUNT_KEY_TAG)
+        {
+            return CompactionDecision::Keep;
+        }
+
         match RowKey::try_from_bytes(key) {
             Ok(row_key) => match row_key {
                 RowKey::Table(table_id, _) => self.filter_table_row_key(table_id, value),
