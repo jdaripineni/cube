@@ -281,8 +281,8 @@ impl RocksCacheStore {
     /// Test-only accessor for the persisted pending-item counter of a prefix, so tests can
     /// assert it matches RocksDB ground truth without exposing this internal state in
     /// production APIs. No rebuild-at-startup step exists for this counter -- see
-    /// `PENDING_COUNT_SCAN_COST.md`'s "Option B" section: the value is persisted directly in
-    /// RocksDB via a merge operator, so it's already correct as soon as the database is open.
+    /// `PENDING_COUNT_SCAN_COST.md` §7: the value is persisted directly in RocksDB via a merge
+    /// operator, so it's already correct as soon as the database is open.
     #[cfg(test)]
     pub async fn queue_pending_count_for_test(&self, prefix: &str) -> u64 {
         let queue_pending_counters = self.queue_pending_counters.clone();
@@ -2801,12 +2801,11 @@ mod tests {
         Ok(())
     }
 
-    /// Proves the core advantage of the RocksDB-merge-operator-backed `QueuePendingCounters`
-    /// (Option B) over the in-process atomic counter this branch shipped first (Option A): the
-    /// persisted count survives a process restart with **no rebuild-from-scan step**. Adds
-    /// items, drops the `RocksCacheStore` (releasing the RocksDB handle), reopens a fresh
-    /// `RocksCacheStore` pointed at the *same* on-disk path, and asserts the counter is
-    /// immediately correct -- before any queue operation has run against the reopened store.
+    /// Proves the persisted, RocksDB-merge-operator-backed `QueuePendingCounters` survives a
+    /// process restart with **no rebuild-from-scan step**. Adds items, drops the
+    /// `RocksCacheStore` (releasing the RocksDB handle), reopens a fresh `RocksCacheStore`
+    /// pointed at the *same* on-disk path, and asserts the counter is immediately correct --
+    /// before any queue operation has run against the reopened store.
     #[tokio::test]
     async fn test_queue_pending_counters_persist_across_restart() -> Result<(), CubeError> {
         init_test_logger().await;

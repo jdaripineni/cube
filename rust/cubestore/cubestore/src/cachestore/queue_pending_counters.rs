@@ -13,10 +13,9 @@ pub const QUEUE_PENDING_COUNT_KEY_TAG: u8 = 0xFE;
 /// Tracks the number of `Pending` queue items per prefix as a value derived, persisted, and
 /// resolved entirely by RocksDB itself via a registered associative merge operator -- so
 /// `QUEUE ADD`/`QUEUE RETRIEVE` no longer need to recompute the count via a full RocksDB index
-/// scan on every call, *and* the count survives a process restart with no rebuild-from-scan step
-/// (unlike an in-process atomic counter). See `PENDING_COUNT_SCAN_COST.md` for the full
-/// problem writeup this fixes, and its "Option B" section for why this approach was chosen over
-/// the simpler in-process atomic counter this branch shipped first.
+/// scan on every call, *and* the count survives a process restart with no rebuild-from-scan step.
+/// See `PENDING_COUNT_SCAN_COST.md` for the full problem writeup and the rationale for this
+/// approach (§5).
 ///
 /// This counter is advisory only -- every call site that reads it places the result directly
 /// into a response field or a log line, never a control-flow decision (the real
