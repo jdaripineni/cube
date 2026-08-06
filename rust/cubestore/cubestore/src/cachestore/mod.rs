@@ -6,6 +6,7 @@ mod lazy;
 mod listener;
 mod queue_item;
 mod queue_item_payload;
+mod queue_pending_counters;
 mod queue_result;
 mod scheduler;
 
